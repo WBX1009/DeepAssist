@@ -1,0 +1,19 @@
+# 基础框架
+fastapi
+uvicorn
+pydantic>=2.0
+pydantic-settings
+
+# AI / 核心编排
+langchain-core
+langgraph
+openai>=1.0.0
+
+# 检索与向量
+sentence-transformers
+chromadb
+whoosh
+jieba
+
+# 展现层
+streamlit
