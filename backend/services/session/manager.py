@@ -34,5 +34,14 @@ class SessionManager:
             
         logger.info(f"✅ 已持久化 {len(messages)} 条对话及工具调用轨迹至数据库。")
 
+    def delete_session(self, session_id: str) -> bool:
+        """
+        生命周期管理：销毁整个会话及其所有关联轨迹
+        """
+        success = self.store.clear_history(session_id)
+        if success:
+            logger.info(f"🗑️[Lifecycle] 会话 {session_id} 及其所有对话轨迹已被永久销毁。")
+        return success
+
     def list_sessions(self) -> List[Dict[str, Any]]:
         return self.store.get_all_sessions()

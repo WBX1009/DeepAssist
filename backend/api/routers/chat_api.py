@@ -37,3 +37,11 @@ def get_chat_history(session_id: str, app: ChatApplication = Depends(get_chat_ap
     # 提取多一点历史用于前端渲染展示
     history = app.session_mgr.get_chat_context(session_id, max_rounds=50) 
     return {"status": "success", "data": history}
+
+@router.delete("/sessions/{session_id}")
+def delete_chat_session(session_id: str, app: ChatApplication = Depends(get_chat_app)):
+    """彻底删除会话及其历史轨迹"""
+    success = app.session_mgr.delete_session(session_id)
+    if success:
+        return {"status": "success", "message": f"会话 {session_id} 已删除"}
+    return {"status": "error", "message": "删除失败"}

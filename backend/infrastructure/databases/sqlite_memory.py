@@ -30,7 +30,7 @@ class SQLiteMemoryStore(BaseMemoryStore):
         try:
             with self._get_connection() as conn:
                 cursor = conn.cursor()
-                # 🚀 扩展表结构：支持工具调用的各种特殊字段
+                # 1. 聊天消息表 (已有的)
                 cursor.execute("""
                     CREATE TABLE IF NOT EXISTS messages (
                         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -41,6 +41,14 @@ class SQLiteMemoryStore(BaseMemoryStore):
                         tool_call_id TEXT,
                         tool_calls TEXT,
                         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                    )
+                """)
+                # 2. 用户画像表 (新增：存储 Key-Value 型的偏好)
+                cursor.execute("""
+                    CREATE TABLE IF NOT EXISTS user_profiles (
+                        key TEXT PRIMARY KEY,
+                        value TEXT,
+                        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                     )
                 """)
                 cursor.execute("CREATE INDEX IF NOT EXISTS idx_session ON messages(session_id)")

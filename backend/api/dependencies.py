@@ -22,6 +22,11 @@ from backend.application.agent_app import AgentApplication
 from backend.application.kb_app import KnowledgeBaseApp
 from backend.core.logger import get_logger
 
+from backend.infrastructure.tools.python_ops import execute_python_code
+from backend.infrastructure.tools.search_ops import web_search
+from backend.infrastructure.tools.sql_ops import query_business_database
+from backend.infrastructure.tools.file_ops import list_sandbox_files # 别忘了之前加的看目录工具
+
 logger = get_logger(__name__)
 
 @lru_cache()
@@ -84,9 +89,18 @@ def get_chat_app() -> ChatApplication:
     )
 
 def get_agent_app() -> AgentApplication:
-    tools =[read_local_file, write_local_file, get_weather, send_email]
+    # 🌟 豪华版工具全家桶
+    tools =[
+        read_local_file, 
+        write_local_file, 
+        list_sandbox_files,  # 文件系统三件套
+        get_weather,         # 真实天气
+        send_email,          # 真实邮件
+        execute_python_code, # Python 沙箱
+        web_search,          # 全网搜索
+        query_business_database # 数据库探查
+    ]
     
-    # 动态装载：如果 Retriever 存在，才给 Agent 装备知识库工具
     retriever = get_retriever()
     if retriever:
         rag_tool_instance = KnowledgeBaseTool(retriever=retriever)

@@ -1,4 +1,5 @@
 import json
+import inspect
 from typing import List, Dict, Any, Callable, Iterator
 from backend.domain.interfaces.llm import BaseLLM
 from backend.core.config import settings
@@ -19,15 +20,32 @@ class AgentEngine:
     def _build_tools_schema(self, tools: List[Callable]) -> List[Dict[str, Any]]:
         schemas =[]
         for tool in tools:
+            sig = inspect.signature(tool)
+            properties = {}
+            required =[]
+            
+            for name, param in sig.parameters.items():
+                # 根据类型提示(Type Hint)动态推断 JSON Schema 类型
+                param_type = "string"
+                if param.annotation == int: param_type = "integer"
+                elif param.annotation == float: param_type = "number"
+                elif param.annotation == bool: param_type = "boolean"
+                
+                properties[name] = {"type": param_type, "description": f"参数 {name}"}
+                
+                # 如果没有默认值，说明是必填项
+                if param.default == inspect.Parameter.empty:
+                    required.append(name)
+                    
             schemas.append({
                 "type": "function",
                 "function": {
                     "name": tool.__name__,
-                    "description": tool.__doc__ or "自定义工具",
+                    "description": tool.__doc__ or f"执行 {tool.__name__} 工具",
                     "parameters": {
                         "type": "object",
-                        "properties": {"query": {"type": "string"}},
-                        "required": ["query"]
+                        "properties": properties,
+                        "required": required
                     }
                 }
             })

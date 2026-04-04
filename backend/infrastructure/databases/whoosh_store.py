@@ -1,9 +1,10 @@
 import os
 import json
-from typing import List, Dict
+import re
+from typing import List, Dict, Any
 from whoosh.index import create_in, open_dir, exists_in
 from whoosh.fields import Schema, TEXT, ID, STORED
-from whoosh.qparser import QueryParser
+from whoosh.qparser import QueryParser, OrGroup
 from jieba.analyse import ChineseAnalyzer
 
 from backend.domain.interfaces.keyword_db import BaseKeywordDB
@@ -18,8 +19,11 @@ class WhooshStore(BaseKeywordDB):
         self.base_path = settings.KEYWORD_DB_PATH
         os.makedirs(self.base_path, exist_ok=True)
         self.analyzer = ChineseAnalyzer()
+        
+        # 🌟 核心：必须保留 source_file，这是支持 CRUD 精准删除的基石
         self.schema = Schema(
             id=ID(stored=True, unique=True),
+            source_file=ID(stored=True),
             content=TEXT(stored=True, analyzer=self.analyzer),
             metadata=STORED()
         )
@@ -34,8 +38,7 @@ class WhooshStore(BaseKeywordDB):
         return col_dir
 
     def _get_or_open_index(self, collection_name: str):
-        """获取或缓存打开的索引对象"""
-        if collection_name in self._index_cache:
+        if collection_name in self._index_cache: 
             return self._index_cache[collection_name]
             
         col_dir = self._get_collection_dir(collection_name)
@@ -53,16 +56,23 @@ class WhooshStore(BaseKeywordDB):
             else:
                 ix = open_dir(col_dir)
                 
-            writer = ix.writer()
-            for chunk in chunks:
-                writer.update_document(
-                    id=chunk.id,
-                    content=chunk.content,
-                    metadata=json.dumps(chunk.metadata, ensure_ascii=False)
-                )
-            writer.commit()
+            # 分配缓冲，加速大批量写入
+            writer = ix.writer(limitmb=1024, multisegment=True)
             
-            # 刷新缓存
+            try:
+                for chunk in chunks:
+                    writer.update_document(
+                        id=chunk.id,
+                        source_file=chunk.metadata.get("source_file", "unknown"),
+                        content=chunk.content,
+                        metadata=json.dumps(chunk.metadata, ensure_ascii=False)
+                    )
+                writer.commit()
+            except Exception as inner_e:
+                # 🚨 极其关键：一旦按了 Ctrl+C 导致中断，强制取消写入，删除 .lock 锁文件！
+                writer.cancel()
+                raise inner_e
+            
             self._index_cache[collection_name] = ix
             logger.info(f"成功向 Whoosh 索引 '{collection_name}' 写入 {len(chunks)} 条文本数据")
             return True
@@ -72,25 +82,52 @@ class WhooshStore(BaseKeywordDB):
 
     def search(self, collection_name: str, query_text: str, top_k: int) -> List[DocumentChunk]:
         ix = self._get_or_open_index(collection_name)
-        if not ix:
+        if not ix: 
             logger.warning(f"Whoosh 索引库 {collection_name} 不存在或尚未构建")
             return []
             
         try:
             chunks =[]
-            # 使用上下文管理器打开 searcher，高效安全
+            # 过滤掉特殊字符，防止 Whoosh 解析器报错
+            clean_query = re.sub(r'[^\w\u4e00-\u9fa5]+', ' ', query_text)
+            
             with ix.searcher() as searcher:
-                query = QueryParser("content", ix.schema).parse(query_text)
+                # 使用 OrGroup 提高召回率（只要匹配部分关键词就召回）
+                parser = QueryParser("content", ix.schema, group=OrGroup.factory(0.9))
+                query = parser.parse(clean_query)
                 results = searcher.search(query, limit=top_k)
                 
                 for hit in results:
                     chunks.append(DocumentChunk(
-                        id=hit["id"],
-                        content=hit["content"],
-                        metadata=json.loads(hit["metadata"]),
-                        score=hit.score 
+                        id=hit["id"], 
+                        content=hit["content"], 
+                        metadata=json.loads(hit["metadata"]), 
+                        score=hit.score
                     ))
             return chunks
         except Exception as e:
             logger.error(f"Whoosh 检索失败: {e}")
             return[]
+
+    def delete_by_source(self, collection_name: str, source_file: str) -> bool:
+        """根据文件路径精准删除所属的所有 Chunk"""
+        col_dir = self._get_collection_dir(collection_name)
+        if not exists_in(col_dir): 
+            return True
+            
+        try:
+            ix = self._get_or_open_index(collection_name)
+            if not ix: 
+                return True
+                
+            writer = ix.writer()
+            # 🛠️ 修复了你第一版代码中不小心删掉的这一行
+            writer.delete_by_term("source_file", source_file)
+            writer.commit()
+            
+            self._index_cache[collection_name] = ix
+            logger.info(f"🗑️ 已从 Whoosh 集合 {collection_name} 中清理文件: {source_file}")
+            return True
+        except Exception as e:
+            logger.error(f"Whoosh 删除历史文件失败: {e}")
+            return False

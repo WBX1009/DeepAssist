@@ -101,3 +101,19 @@ class ChromaStore(BaseVectorDB):
         except Exception as e:
             logger.error(f"ChromaDB 检索失败: {e}")
             return []
+
+    def delete_by_source(self, collection_name: str, source_file: str) -> bool:
+        """根据文件路径精准删除所属的所有 Chunk"""
+        try:
+            # 如果集合不存在，说明是第一次建库，直接跳过
+            try:
+                collection = self.client.get_collection(name=collection_name)
+            except Exception:
+                return True
+                
+            collection.delete(where={"source_file": source_file})
+            logger.info(f"🗑️ 已从 Chroma 集合 {collection_name} 中清理文件: {source_file}")
+            return True
+        except Exception as e:
+            logger.error(f"ChromaDB 删除历史文件失败: {e}")
+            return False        
