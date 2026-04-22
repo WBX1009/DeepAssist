@@ -10,7 +10,6 @@ from backend.infrastructure.databases.sqlite_memory import SQLiteMemoryStore
 from backend.infrastructure.tools.rag_tool import KnowledgeBaseTool
 from backend.infrastructure.tools.file_ops import read_local_file, write_local_file
 from backend.infrastructure.tools.weather_ops import get_weather
-from backend.infrastructure.tools.email_ops import send_email
 
 from backend.services.session.manager import SessionManager
 from backend.services.rag.fusion import HybridRetriever
@@ -23,7 +22,6 @@ from backend.application.kb_app import KnowledgeBaseApp
 from backend.core.logger import get_logger
 
 from backend.infrastructure.tools.python_ops import execute_python_code
-from backend.infrastructure.tools.search_ops import web_search
 from backend.infrastructure.tools.sql_ops import query_business_database
 from backend.infrastructure.tools.file_ops import list_sandbox_files # 别忘了之前加的看目录工具
 
@@ -95,9 +93,7 @@ def get_agent_app() -> AgentApplication:
         write_local_file, 
         list_sandbox_files,  # 文件系统三件套
         get_weather,         # 真实天气
-        send_email,          # 真实邮件
         execute_python_code, # Python 沙箱
-        web_search,          # 全网搜索
         query_business_database # 数据库探查
     ]
     

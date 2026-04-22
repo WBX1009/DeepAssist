@@ -61,11 +61,14 @@ class SQLiteMemoryStore(BaseMemoryStore):
             with self._get_connection() as conn:
                 cursor = conn.cursor()
                 safe_limit = limit * 4 
+                
+                # 🚨 致命 Bug 修复：将 ORDER BY created_at 改为 ORDER BY id
+                # 因为 id 是 AUTOINCREMENT，绝对保证了插入的物理先后顺序
                 cursor.execute("""
                     SELECT role, content, name, tool_call_id, tool_calls 
                     FROM messages 
                     WHERE session_id = ? 
-                    ORDER BY created_at DESC LIMIT ?
+                    ORDER BY id DESC LIMIT ?
                 """, (session_id, safe_limit))
                 
                 rows = cursor.fetchall()
@@ -74,7 +77,6 @@ class SQLiteMemoryStore(BaseMemoryStore):
                 for row in reversed(rows):
                     role, content, name, tool_call_id, tool_calls_json = row
                     
-                    # 🟢 架构优化：直接反序列化为 Pydantic Domain 实体
                     if tool_calls_json:
                         msg = AIMessage(
                             role=role,
