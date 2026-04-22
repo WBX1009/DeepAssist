@@ -64,6 +64,8 @@ Thumbs.db
 # =========================
 code_dump.txt
 tree_output.txt
+test.py
+*.ipynb
 
 # =========================
 # workspace（你的实验区）
