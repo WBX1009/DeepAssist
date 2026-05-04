@@ -113,33 +113,48 @@ class ToolResult(BaseModel):
         )
 
     @classmethod
-    def unknown_tool(cls, call: ToolCall, available_tools: str) -> "ToolResult":
+    def unknown_tool(
+        cls,
+        call: ToolCall,
+        available_tools: str,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> "ToolResult":
         return cls(
             tool_call_id=call.id,
             name=call.name,
             success=False,
             error=f"Unknown tool '{call.name}'. Available tools: {available_tools}",
-            metadata={"error_type": "unknown_tool"},
+            metadata=metadata or {"error_type": "unknown_tool"},
         )
 
     @classmethod
-    def invalid_arguments(cls, call: ToolCall, error: str) -> "ToolResult":
+    def invalid_arguments(
+        cls,
+        call: ToolCall,
+        error: str,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> "ToolResult":
         return cls(
             tool_call_id=call.id,
             name=call.name,
             success=False,
             error=f"Invalid tool arguments for '{call.name}': {error}",
-            metadata={"error_type": "invalid_arguments"},
+            metadata=metadata or {"error_type": "invalid_arguments"},
         )
 
     @classmethod
-    def execution_failed(cls, call: ToolCall, error: str) -> "ToolResult":
+    def execution_failed(
+        cls,
+        call: ToolCall,
+        error: str,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> "ToolResult":
         return cls(
             tool_call_id=call.id,
             name=call.name,
             success=False,
             error=f"Tool execution failed for '{call.name}': {error}",
-            metadata={"error_type": "tool_execution_failed"},
+            metadata=metadata or {"error_type": "tool_execution_failed"},
         )
 
     @classmethod
@@ -161,12 +176,59 @@ class ToolResult(BaseModel):
         if self.success:
             return self.content
         error = self.error or self.content
+        metadata_lines = self._metadata_hint_lines()
+        hint_block = "\n".join(metadata_lines)
+        if hint_block:
+            hint_block = f"{hint_block}\n"
         return (
             f"{error}\n"
+            f"{hint_block}"
             "Self-correction hint: inspect the tool name and arguments, then either "
             "retry with corrected JSON arguments, choose a better tool, or answer "
             "without the tool if it is not needed."
         )
+
+    def repair_strategy(self) -> str:
+        return str(self.metadata.get("repair_strategy") or "")
+
+    def is_retryable(self) -> bool:
+        return bool(self.metadata.get("retryable"))
+
+    def _metadata_hint_lines(self) -> list[str]:
+        if not self.metadata:
+            return []
+
+        lines: list[str] = []
+        diagnosis = self.metadata.get("diagnosis")
+        if diagnosis:
+            lines.append(f"Diagnosis: {diagnosis}")
+
+        suggested_tool = self.metadata.get("suggested_tool")
+        if suggested_tool:
+            lines.append(f"Suggested tool: {suggested_tool}")
+
+        missing = self.metadata.get("missing_required_args") or []
+        if missing:
+            lines.append(f"Missing required args: {', '.join(str(item) for item in missing)}")
+
+        unexpected = self.metadata.get("unexpected_args") or []
+        if unexpected:
+            lines.append(f"Unexpected args: {', '.join(str(item) for item in unexpected)}")
+
+        type_errors = self.metadata.get("argument_type_errors") or []
+        if type_errors:
+            rendered = ", ".join(str(item) for item in type_errors)
+            lines.append(f"Argument type issues: {rendered}")
+
+        allowed = self.metadata.get("allowed_tools") or self.metadata.get("available_tools") or []
+        if isinstance(allowed, list) and allowed:
+            lines.append(f"Available tools: {', '.join(str(item) for item in allowed)}")
+
+        strategy = self.metadata.get("repair_strategy")
+        if strategy:
+            lines.append(f"Repair strategy: {strategy}")
+
+        return lines
 
     def to_tool_message(self) -> Dict[str, Any]:
         return {

@@ -699,6 +699,16 @@ def render_event_trace_v2(events: List[Dict[str, Any]]) -> None:
                 )
             elif event_name == "self_correction":
                 st.markdown(f"- Self correction: {event.get('message') or data.get('error')}")
+                if data:
+                    st.markdown(
+                        f"- Strategy: `{data.get('repair_strategy', 'n/a')}` "
+                        f"retryable=`{data.get('retryable')}` "
+                        f"remaining_budget=`{data.get('remaining_self_corrections')}`"
+                    )
+                    if data.get("diagnosis"):
+                        st.caption(f"Diagnosis: {data.get('diagnosis')}")
+                    if data.get("suggested_tool"):
+                        st.caption(f"Suggested tool: {data.get('suggested_tool')}")
             elif event_name == "reasoning":
                 st.markdown("- Reasoning snippet")
                 st.code(event.get("content", ""), language="text")

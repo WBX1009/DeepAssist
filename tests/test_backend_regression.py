@@ -1,17 +1,22 @@
 import json
 import unittest
+from types import SimpleNamespace
 from typing import Any
 
 from backend.application.agent_app import AgentApplication
 from backend.application.chat_app import ChatApplication
 from backend.application.kb_app import KnowledgeBaseApp
+from backend.domain.entities.agent_run import AgentRunConfig
 from backend.domain.entities.document import DocumentChunk
 from backend.domain.entities.knowledge_base import KnowledgeBaseHealthReport
 from backend.domain.entities.rag_pipeline import RAGPipelineResult
 from backend.domain.entities.retrieval import Citation, RAGContextPack, RerankTrace, RetrievalResult
+from backend.domain.entities.tooling import ToolCall
 from backend.domain.interfaces.memory_db import BaseMemoryStore
 from backend.infrastructure.tools.rag_tool import KnowledgeBaseTool
+from backend.services.agent.engine import AgentEngine
 from backend.services.agent.intent_router import IntentRouter
+from backend.services.agent.tooling import ToolRegistry
 from backend.services.context_engine import ContextEngine
 from backend.services.session.manager import SessionManager
 
@@ -55,6 +60,16 @@ class FakeLLM:
         self.calls.append(messages)
         for chunk in self.chunks:
             yield chunk
+
+
+class FakeAgentLLM:
+    def __init__(self, responses: list[Any]):
+        self.responses = responses
+        self.calls: list[list[dict[str, Any]]] = []
+
+    def chat(self, messages, tools=None, model_name=None, temperature=None, top_p=None):
+        self.calls.append(messages)
+        return self.responses[len(self.calls) - 1]
 
 
 class FakeProfileExtractor:
@@ -452,6 +467,90 @@ class BackendRegressionTests(unittest.TestCase):
         trace_payloads = [payload for payload in payloads if payload.get("event") == "context_window_trace"]
         self.assertTrue(trace_payloads)
         self.assertIn("budget", trace_payloads[0]["data"])
+
+    def test_tool_registry_returns_structured_argument_repair_metadata(self):
+        def sample_tool(city: str, days: int) -> str:
+            return f"{city}:{days}"
+
+        registry = ToolRegistry.from_callables([sample_tool])
+        call = ToolCall(id="tool-1", name="sample_tool", args={"city": "beijing"})
+
+        result = registry.execute(call)
+
+        self.assertFalse(result.success)
+        self.assertEqual(result.metadata.get("error_type"), "invalid_arguments")
+        self.assertEqual(result.metadata.get("repair_strategy"), "fix_arguments")
+        self.assertIn("days", result.metadata.get("missing_required_args", []))
+        self.assertTrue(result.is_retryable())
+
+    def test_tool_registry_suggests_closest_tool_for_unknown_name(self):
+        def weather_lookup(city: str) -> str:
+            return city
+
+        registry = ToolRegistry.from_callables([weather_lookup])
+        call = ToolCall(id="tool-2", name="weather_lookp", args={"city": "beijing"})
+
+        result = registry.execute(call)
+
+        self.assertFalse(result.success)
+        self.assertEqual(result.metadata.get("error_type"), "unknown_tool")
+        self.assertEqual(result.metadata.get("suggested_tool"), "weather_lookup")
+        self.assertEqual(result.metadata.get("repair_strategy"), "switch_tool")
+
+    def test_agent_engine_injects_self_correction_instruction_after_tool_failure(self):
+        def sample_tool(city: str, days: int) -> str:
+            return f"{city}:{days}"
+
+        first_response = SimpleNamespace(
+            content="",
+            tool_calls=[
+                {
+                    "id": "call-1",
+                    "type": "function",
+                    "function": {
+                        "name": "sample_tool",
+                        "arguments": json.dumps({"city": "beijing"}),
+                    },
+                }
+            ],
+            reasoning_content=None,
+        )
+        second_response = SimpleNamespace(
+            content="Recovered with fallback answer.",
+            tool_calls=[],
+            reasoning_content=None,
+        )
+        llm = FakeAgentLLM([first_response, second_response])
+        engine = AgentEngine(
+            llm=llm,
+            tool_registry=ToolRegistry.from_callables([sample_tool]),
+            run_config=AgentRunConfig(max_iterations=3, max_self_corrections=2),
+        )
+
+        events = list(
+            engine.stream_run(
+                [
+                    {"role": "system", "content": "agent"},
+                    {"role": "user", "content": "check weather"},
+                ]
+            )
+        )
+
+        self.assertEqual(len(llm.calls), 2)
+        second_call_messages = llm.calls[1]
+        system_messages = [
+            message["content"]
+            for message in second_call_messages
+            if message.get("role") == "system"
+        ]
+        self.assertTrue(
+            any("[Self-Correction Instruction]" in content for content in system_messages)
+        )
+        self.assertTrue(any("Missing required args" in content for content in system_messages))
+
+        self_corrections = [event for event in events if event.get("type") == "self_correction"]
+        self.assertTrue(self_corrections)
+        self.assertEqual(self_corrections[0]["data"].get("repair_strategy"), "fix_arguments")
 
 
 if __name__ == "__main__":

@@ -125,6 +125,9 @@ class AgentEngine:
                     return
 
                 if not tool_result.success:
+                    current_messages.append(
+                        self._self_correction_message(tool_result, lifecycle)
+                    )
                     yield self._self_correction_event(tool_result, lifecycle)
 
         yield self._terminal_error_event(lifecycle)
@@ -184,6 +187,10 @@ class AgentEngine:
         tool_result: ToolResult,
         lifecycle: AgentLifecycle,
     ) -> Dict[str, Any]:
+        remaining_budget = max(
+            self.run_config.max_self_corrections - lifecycle.state.self_corrections,
+            0,
+        )
         return {
             "type": "self_correction",
             "content": (
@@ -193,7 +200,71 @@ class AgentEngine:
             "tool_call_id": tool_result.tool_call_id,
             "name": tool_result.name,
             "error": tool_result.error,
+            "retryable": tool_result.is_retryable(),
+            "repair_strategy": tool_result.repair_strategy(),
             "state": lifecycle.state.terminal_payload(),
+            "data": {
+                "retryable": tool_result.is_retryable(),
+                "repair_strategy": tool_result.repair_strategy(),
+                "diagnosis": tool_result.metadata.get("diagnosis"),
+                "suggested_tool": tool_result.metadata.get("suggested_tool"),
+                "remaining_self_corrections": remaining_budget,
+                "tool_metadata": tool_result.metadata,
+            },
+        }
+
+    def _self_correction_message(
+        self,
+        tool_result: ToolResult,
+        lifecycle: AgentLifecycle,
+    ) -> Dict[str, Any]:
+        remaining_budget = max(
+            self.run_config.max_self_corrections - lifecycle.state.self_corrections,
+            0,
+        )
+        lines = [
+            "[Self-Correction Instruction]",
+            f"Tool failure for `{tool_result.name}`.",
+            f"Remaining self-correction budget: {remaining_budget}.",
+        ]
+
+        diagnosis = tool_result.metadata.get("diagnosis")
+        if diagnosis:
+            lines.append(f"Diagnosis: {diagnosis}")
+
+        repair_strategy = tool_result.repair_strategy()
+        if repair_strategy:
+            lines.append(f"Repair strategy: {repair_strategy}")
+
+        suggested_tool = tool_result.metadata.get("suggested_tool")
+        if suggested_tool:
+            lines.append(f"Suggested tool: {suggested_tool}")
+
+        missing_args = tool_result.metadata.get("missing_required_args") or []
+        if missing_args:
+            lines.append(
+                "Missing required args: " + ", ".join(str(item) for item in missing_args)
+            )
+
+        type_errors = tool_result.metadata.get("argument_type_errors") or []
+        if type_errors:
+            lines.append(
+                "Argument type issues: " + ", ".join(str(item) for item in type_errors)
+            )
+
+        if tool_result.is_retryable():
+            lines.append(
+                "Retry only if you can materially improve the tool name or arguments; "
+                "otherwise continue with a fallback answer."
+            )
+        else:
+            lines.append(
+                "Do not retry the same tool path. Choose a different tool or answer without it."
+            )
+
+        return {
+            "role": "system",
+            "content": "\n".join(lines),
         }
 
     def _finish_event(

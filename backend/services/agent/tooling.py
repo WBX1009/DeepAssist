@@ -1,4 +1,5 @@
 import inspect
+from difflib import get_close_matches
 from dataclasses import dataclass
 from typing import Any, Callable, Dict, Iterable, List, Optional, Set, get_origin
 
@@ -94,17 +95,31 @@ class ToolRegistry:
     def execute(self, tool_call: ToolCall) -> ToolResult:
         spec = self._tools.get(tool_call.name)
         if not spec:
-            return ToolResult.unknown_tool(tool_call, self._available_tool_names())
+            return ToolResult.unknown_tool(
+                tool_call,
+                self._available_tool_names(),
+                metadata=self._unknown_tool_metadata(tool_call),
+            )
 
         if not self.policy.can_execute(tool_call.name):
             return ToolResult.execution_failed(
                 tool_call,
                 f"Tool is blocked by policy: {tool_call.name}",
-            ).model_copy(update={"metadata": {"error_type": "tool_blocked"}})
+                metadata={
+                    "error_type": "tool_blocked",
+                    "retryable": False,
+                    "repair_strategy": "fallback_answer",
+                    "diagnosis": "The requested tool is blocked by execution policy.",
+                },
+            )
 
         validation_error = self._validate_arguments(spec, tool_call.args)
         if validation_error:
-            return ToolResult.invalid_arguments(tool_call, validation_error)
+            return ToolResult.invalid_arguments(
+                tool_call,
+                validation_error,
+                metadata=self._invalid_argument_metadata(spec, tool_call, validation_error),
+            )
 
         try:
             raw_result = spec.handler(**tool_call.args)
@@ -113,7 +128,11 @@ class ToolRegistry:
             else:
                 result = ToolResult.ok(tool_call, str(raw_result))
         except Exception as exc:
-            result = ToolResult.execution_failed(tool_call, str(exc))
+            result = ToolResult.execution_failed(
+                tool_call,
+                str(exc),
+                metadata=self._execution_failure_metadata(spec, tool_call, exc),
+            )
 
         return self.policy.apply_result_limits(result)
 
@@ -194,3 +213,96 @@ class ToolRegistry:
         if annotation == dict or origin == dict:
             return isinstance(value, dict)
         return True
+
+    def _unknown_tool_metadata(self, tool_call: ToolCall) -> Dict[str, Any]:
+        tool_names = sorted(self._tools)
+        matches = get_close_matches(tool_call.name, tool_names, n=1, cutoff=0.5)
+        metadata: Dict[str, Any] = {
+            "error_type": "unknown_tool",
+            "retryable": bool(matches),
+            "repair_strategy": "switch_tool" if matches else "fallback_answer",
+            "available_tools": tool_names,
+            "diagnosis": "The tool name does not match any registered tool.",
+        }
+        if matches:
+            metadata["suggested_tool"] = matches[0]
+        return metadata
+
+    def _invalid_argument_metadata(
+        self,
+        spec: ToolSpec,
+        tool_call: ToolCall,
+        validation_error: str,
+    ) -> Dict[str, Any]:
+        required_args = [
+            name
+            for name, parameter in spec.signature.parameters.items()
+            if parameter.default == inspect.Parameter.empty
+        ]
+        provided_args = set(tool_call.args)
+        expected_args = set(spec.signature.parameters)
+        missing_required_args = [name for name in required_args if name not in provided_args]
+        unexpected_args = sorted(provided_args - expected_args)
+        argument_type_errors = self._argument_type_errors(spec, tool_call.args)
+        return {
+            "error_type": "invalid_arguments",
+            "retryable": True,
+            "repair_strategy": "fix_arguments",
+            "diagnosis": validation_error,
+            "required_args": required_args,
+            "missing_required_args": missing_required_args,
+            "unexpected_args": unexpected_args,
+            "argument_type_errors": argument_type_errors,
+            "allowed_tools": sorted(self._tools),
+        }
+
+    def _execution_failure_metadata(
+        self,
+        spec: ToolSpec,
+        tool_call: ToolCall,
+        exc: Exception,
+    ) -> Dict[str, Any]:
+        error_text = str(exc).lower()
+        diagnosis = "The tool raised an exception during execution."
+        repair_strategy = "adjust_arguments_or_fallback"
+        retryable = True
+
+        if "missing" in error_text or "not found" in error_text:
+            diagnosis = "The tool could not find the requested target or input."
+            repair_strategy = "adjust_arguments"
+        elif "permission" in error_text or "denied" in error_text:
+            diagnosis = "The tool lacks permission to access the requested resource."
+            repair_strategy = "fallback_answer"
+            retryable = False
+        elif "timeout" in error_text:
+            diagnosis = "The tool timed out before producing a result."
+            repair_strategy = "retry_or_fallback"
+        elif "json" in error_text or "decode" in error_text:
+            diagnosis = "The tool received malformed structured input."
+            repair_strategy = "fix_arguments"
+
+        return {
+            "error_type": "tool_execution_failed",
+            "retryable": retryable,
+            "repair_strategy": repair_strategy,
+            "diagnosis": diagnosis,
+            "exception_type": type(exc).__name__,
+            "tool_name": spec.name,
+            "allowed_tools": sorted(self._tools),
+            "provided_args": {key: type(value).__name__ for key, value in tool_call.args.items()},
+        }
+
+    def _argument_type_errors(self, spec: ToolSpec, args: Dict[str, Any]) -> List[str]:
+        issues: List[str] = []
+        for name, value in args.items():
+            parameter = spec.signature.parameters.get(name)
+            if parameter is None:
+                continue
+            expected = parameter.annotation
+            if expected == inspect.Parameter.empty:
+                continue
+            if self._matches_annotation(value, expected):
+                continue
+            expected_name = getattr(expected, "__name__", str(expected))
+            issues.append(f"{name} expected {expected_name}, got {type(value).__name__}")
+        return issues
