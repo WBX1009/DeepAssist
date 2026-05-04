@@ -47,10 +47,17 @@ class AgentApplication:
         try:
             logger.info("Entering agent mode for session %s", session_id)
 
-            history = self.session_mgr.get_chat_context(
+            context_plan = self.session_mgr.plan_chat_context(
                 session_id,
                 max_rounds=history_budget,
             )
+            history = context_plan.flattened_messages()
+            if context_plan.summary is not None:
+                yield SSEManager.format_event(
+                    StreamEvent.status(
+                        f"Compressed {context_plan.summary.dropped_turn_count} earlier turns into a continuity summary."
+                    )
+                )
             user_profile = (
                 self.profile_extractor.render_profile() if use_user_memory else None
             )

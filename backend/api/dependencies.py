@@ -43,6 +43,7 @@ from backend.services.rag.query_rewriter import QueryRewriteService
 from backend.services.rag.reranker import LexicalOverlapReranker
 from backend.services.session.context_window_manager import PriorityContextWindowManager
 from backend.services.session.manager import SessionManager
+from backend.services.session.summary_compressor import ConversationSummaryCompressor
 from backend.common.config import settings
 
 logger = get_logger(__name__)
@@ -174,12 +175,18 @@ def get_session_manager() -> SessionManager:
     return SessionManager(
         memory_store=get_memory_store(),
         context_window_manager=get_context_window_manager(),
+        summary_compressor=get_summary_compressor(),
     )
 
 
 @lru_cache()
 def get_context_window_manager() -> PriorityContextWindowManager:
     return PriorityContextWindowManager()
+
+
+@lru_cache()
+def get_summary_compressor() -> ConversationSummaryCompressor:
+    return ConversationSummaryCompressor()
 
 
 @lru_cache()

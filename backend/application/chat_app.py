@@ -52,7 +52,7 @@ class ChatApplication:
         return self.session_mgr.list_sessions()
 
     def get_history(self, session_id: str, max_rounds: int = 50) -> list[dict]:
-        return self.session_mgr.get_chat_context(session_id, max_rounds=max_rounds)
+        return self.session_mgr.get_session_history(session_id, limit=max_rounds)
 
     def delete_session(self, session_id: str) -> bool:
         return self.session_mgr.delete_session(session_id)
@@ -84,10 +84,17 @@ class ChatApplication:
 
             if mode == "quick":
                 logger.info("Entering quick chat mode")
-                history = self.session_mgr.get_chat_context(
+                context_plan = self.session_mgr.plan_chat_context(
                     session_id,
                     max_rounds=history_budget,
                 )
+                history = context_plan.flattened_messages()
+                if context_plan.summary is not None:
+                    yield SSEManager.format_event(
+                        StreamEvent.status(
+                            f"Compressed {context_plan.summary.dropped_turn_count} earlier turns into a continuity summary."
+                        )
+                    )
                 user_profile = self._render_user_profile(use_user_memory)
                 context = self.context_engine.build_quick_context(
                     query=query,
@@ -115,10 +122,17 @@ class ChatApplication:
                             "Detected a casual chat query; switching to general chat."
                         )
                     )
-                    history = self.session_mgr.get_chat_context(
+                    context_plan = self.session_mgr.plan_chat_context(
                         session_id,
                         max_rounds=history_budget,
                     )
+                    history = context_plan.flattened_messages()
+                    if context_plan.summary is not None:
+                        yield SSEManager.format_event(
+                            StreamEvent.status(
+                                f"Compressed {context_plan.summary.dropped_turn_count} earlier turns into a continuity summary."
+                            )
+                        )
                     user_profile = self._render_user_profile(use_user_memory)
                     fallback_context = self.context_engine.build_quick_context(
                         query=query,
@@ -144,10 +158,17 @@ class ChatApplication:
                     yield SSEManager.format_end()
                     return
 
-                history = self.session_mgr.get_chat_context(
+                context_plan = self.session_mgr.plan_chat_context(
                     session_id,
                     max_rounds=history_budget,
                 )
+                history = context_plan.flattened_messages()
+                if context_plan.summary is not None:
+                    yield SSEManager.format_event(
+                        StreamEvent.status(
+                            f"Compressed {context_plan.summary.dropped_turn_count} earlier turns into a continuity summary."
+                        )
+                    )
                 user_profile = self._render_user_profile(use_user_memory)
                 pipeline_result = self.rag_pipeline.build_context(
                     query=query,

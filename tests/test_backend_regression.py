@@ -311,10 +311,26 @@ class BackendRegressionTests(unittest.TestCase):
         history = session_manager.get_chat_context(session_id, max_rounds=6)
         user_messages = [message["content"] for message in history if message["role"] == "user"]
 
+        self.assertEqual(history[0]["role"], "system")
+        self.assertIn("[Conversation Summary]", history[0]["content"])
         self.assertIn("I am a backend engineer, please answer concisely.", user_messages)
         self.assertIn("random follow-up two", user_messages)
         self.assertIn("latest production issue?", user_messages)
         self.assertNotIn("hello", user_messages)
+
+    def test_session_history_remains_full_without_summary_injection(self):
+        store = FakeMemoryStore()
+        session_manager = SessionManager(store)
+        session_id = "session-history"
+
+        session_manager.save_interaction(session_id, "first", "one")
+        session_manager.save_interaction(session_id, "second", "two")
+        session_manager.save_interaction(session_id, "third", "three")
+
+        history = session_manager.get_session_history(session_id, limit=10)
+
+        self.assertEqual([message["role"] for message in history], ["user", "assistant"] * 3)
+        self.assertNotIn("[Conversation Summary]", "\n".join(message["content"] for message in history))
 
 
 if __name__ == "__main__":
