@@ -5,8 +5,9 @@ import chromadb
 
 from backend.domain.interfaces.vector_db import BaseVectorDB
 from backend.domain.entities.document import DocumentChunk
-from backend.core.config import settings
-from backend.core.logger import get_logger
+from backend.domain.entities.knowledge_base import KnowledgeBaseFile
+from backend.common.config import settings
+from backend.common.logger import get_logger
 
 logger = get_logger(__name__)
 
@@ -112,8 +113,83 @@ class ChromaStore(BaseVectorDB):
                 return True
                 
             collection.delete(where={"source_file": source_file})
+            try:
+                collection.delete(where={"source": source_file})
+            except Exception:
+                # Backward compatibility for older indexes that never used source.
+                pass
             logger.info(f"🗑️ 已从 Chroma 集合 {collection_name} 中清理文件: {source_file}")
             return True
         except Exception as e:
             logger.error(f"ChromaDB 删除历史文件失败: {e}")
-            return False        
+            return False
+
+    def list_sources(self, collection_name: str) -> List[KnowledgeBaseFile]:
+        """Return file-level chunk counts from Chroma metadata."""
+        try:
+            try:
+                collection = self.client.get_collection(name=collection_name)
+            except Exception:
+                return []
+
+            source_map: Dict[str, KnowledgeBaseFile] = {}
+            batch_size = 500
+            offset = 0
+            total = None
+
+            try:
+                total = int(collection.count())
+            except Exception:
+                total = None
+
+            while True:
+                results = collection.get(
+                    include=["metadatas"],
+                    limit=batch_size,
+                    offset=offset,
+                )
+                metadatas = results.get("metadatas") or []
+                if not metadatas:
+                    break
+
+                for metadata in metadatas:
+                    metadata = metadata or {}
+                    source_file = metadata.get("source_file") or metadata.get("source")
+                    if not source_file:
+                        continue
+
+                    current = source_map.get(source_file)
+                    if current is None:
+                        source_map[source_file] = KnowledgeBaseFile(
+                            source_file=source_file,
+                            chunk_count=1,
+                            metadata={"first_chunk_metadata": metadata},
+                        )
+                        continue
+
+                    source_map[source_file] = current.model_copy(
+                        update={"chunk_count": current.chunk_count + 1}
+                    )
+
+                offset += len(metadatas)
+                if total is not None and offset >= total:
+                    break
+
+            return sorted(source_map.values(), key=lambda item: item.source_file.lower())
+        except Exception as e:
+            logger.error(f"ChromaDB list sources failed: {e}")
+            return []
+
+    def list_collections(self) -> List[str]:
+        try:
+            collections = self.client.list_collections()
+            names = []
+            for collection in collections:
+                if isinstance(collection, str):
+                    names.append(collection)
+                else:
+                    names.append(collection.name)
+            return sorted(set(names))
+        except Exception as e:
+            logger.error(f"ChromaDB list collections failed: {e}")
+            return []

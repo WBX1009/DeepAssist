@@ -3,8 +3,8 @@ import warnings
 from typing import List
 
 from backend.domain.interfaces.embedding import BaseEmbedding
-from backend.core.config import settings
-from backend.core.logger import get_logger
+from backend.common.config import settings
+from backend.common.logger import get_logger
 
 warnings.filterwarnings("ignore")
 logger = get_logger(__name__)

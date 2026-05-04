@@ -1,6 +1,6 @@
 import sqlite3
-from backend.core.config import settings
-from backend.core.logger import get_logger
+from backend.common.config import settings
+from backend.common.logger import get_logger
 
 logger = get_logger(__name__)
 

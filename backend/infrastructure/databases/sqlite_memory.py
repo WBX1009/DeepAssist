@@ -1,24 +1,24 @@
 import os
 import sqlite3
 import json
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Optional
 
 from backend.domain.interfaces.memory_db import BaseMemoryStore
 from backend.domain.entities.message import Message, AIMessage
-from backend.core.config import settings
-from backend.core.logger import get_logger
+from backend.common.config import settings
+from backend.common.logger import get_logger
 
 logger = get_logger(__name__)
 
 
 class SQLiteMemoryStore(BaseMemoryStore):
     def __init__(self):
-        base_dir = os.path.dirname(settings.VECTOR_DB_PATH)
+        self.db_path = settings.CONVERSATION_DB_PATH
+        base_dir = os.path.dirname(self.db_path)
         if not base_dir:
             base_dir = "."
             
         os.makedirs(base_dir, exist_ok=True)
-        self.db_path = os.path.join(base_dir, "chat_history.db")
         
         self._init_db()
         logger.info(f"✅ SQLite 记忆库初始化完成: {self.db_path}")
@@ -177,3 +177,44 @@ class SQLiteMemoryStore(BaseMemoryStore):
         except Exception as e:
             logger.error(f"获取会话列表失败: {e}")
             return[]          
+
+    def get_profile(self, key: str) -> Optional[str]:
+        try:
+            with self._get_connection() as conn:
+                cursor = conn.cursor()
+                cursor.execute("SELECT value FROM user_profiles WHERE key = ?", (key,))
+                row = cursor.fetchone()
+                return row[0] if row else None
+        except Exception as e:
+            logger.error(f"Failed to read user profile [{key}]: {e}")
+            return None
+
+    def set_profile(self, key: str, value: str) -> bool:
+        try:
+            with self._get_connection() as conn:
+                cursor = conn.cursor()
+                cursor.execute(
+                    """
+                    INSERT INTO user_profiles (key, value, updated_at)
+                    VALUES (?, ?, CURRENT_TIMESTAMP)
+                    ON CONFLICT(key) DO UPDATE SET
+                        value = excluded.value,
+                        updated_at = CURRENT_TIMESTAMP
+                    """,
+                    (key, value),
+                )
+                conn.commit()
+            return True
+        except Exception as e:
+            logger.error(f"Failed to write user profile [{key}]: {e}")
+            return False
+
+    def get_all_profiles(self) -> Dict[str, str]:
+        try:
+            with self._get_connection() as conn:
+                cursor = conn.cursor()
+                cursor.execute("SELECT key, value FROM user_profiles ORDER BY key ASC")
+                return {key: value for key, value in cursor.fetchall()}
+        except Exception as e:
+            logger.error(f"Failed to read user profiles: {e}")
+            return {}
