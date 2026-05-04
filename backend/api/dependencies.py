@@ -1,114 +1,294 @@
 from functools import lru_cache
-import os
+from typing import Any, Callable, List, Optional
 
-from backend.infrastructure.llms.deepseek_client import DeepSeekClient
-from backend.infrastructure.embeddings.bge_m3_local import BGEM3Local
-from backend.infrastructure.databases.chroma_store import ChromaStore
-from backend.infrastructure.databases.whoosh_store import WhooshStore
-from backend.infrastructure.databases.sqlite_memory import SQLiteMemoryStore
-
-from backend.infrastructure.tools.rag_tool import KnowledgeBaseTool
-from backend.infrastructure.tools.file_ops import read_local_file, write_local_file
-from backend.infrastructure.tools.weather_ops import get_weather
-
-from backend.services.session.manager import SessionManager
-from backend.services.rag.fusion import HybridRetriever
-from backend.services.rag.chunking import DocumentChunker
-from backend.services.agent.engine import AgentEngine
-
-from backend.application.chat_app import ChatApplication
 from backend.application.agent_app import AgentApplication
+from backend.application.chat_app import ChatApplication
 from backend.application.kb_app import KnowledgeBaseApp
-from backend.core.logger import get_logger
-
+from backend.common.event_bus import event_bus
+from backend.common.logger import get_logger
+from backend.domain.interfaces.embedding import BaseEmbedding
+from backend.domain.interfaces.keyword_db import BaseKeywordDB
+from backend.domain.interfaces.llm import BaseLLM
+from backend.domain.interfaces.memory_db import BaseMemoryStore
+from backend.domain.interfaces.vector_db import BaseVectorDB
+from backend.infrastructure.databases.chroma_store import ChromaStore
+from backend.infrastructure.databases.sqlite_memory import SQLiteMemoryStore
+from backend.infrastructure.databases.whoosh_store import WhooshStore
+from backend.infrastructure.embeddings.bge_m3_local import BGEM3Local
+from backend.infrastructure.llms.deepseek_client import DeepSeekClient
+from backend.infrastructure.tools.file_ops import (
+    list_sandbox_files,
+    read_local_file,
+    write_local_file,
+)
 from backend.infrastructure.tools.python_ops import execute_python_code
+from backend.infrastructure.tools.rag_tool import KnowledgeBaseTool
 from backend.infrastructure.tools.sql_ops import query_business_database
-from backend.infrastructure.tools.file_ops import list_sandbox_files # 别忘了之前加的看目录工具
+from backend.infrastructure.tools.weather_ops import get_weather
+from backend.services.agent.engine import AgentEngine
+from backend.services.agent.intent_router import IntentRouter
+from backend.services.agent.supervisor import AgentSupervisor
+from backend.services.agent.tooling import ToolPolicy, ToolRegistry
+from backend.services.agent.workers import ChatWorker, RAGWorker, ToolAgentWorker
+from backend.services.context_engine import ContextEngine
+from backend.services.profile_extractor import ProfileExtractor
+from backend.services.rag.answer_guard import SourceAwareResponseGuard
+from backend.services.rag.chunking import DocumentChunker
+from backend.services.rag.context_packer import ContextPacker
+from backend.services.rag.fusion import HybridRetriever
+from backend.services.rag.pipeline import RAGPipeline
+from backend.services.rag.query_planner import QueryPlanner
+from backend.services.rag.query_rewriter import QueryRewriteService
+from backend.services.rag.reranker import LexicalOverlapReranker
+from backend.services.session.manager import SessionManager
 
 logger = get_logger(__name__)
 
+
+# -----------------------------------------------------------------------------
+# Infrastructure adapters
+# -----------------------------------------------------------------------------
+
+
 @lru_cache()
-def get_llm():
+def get_llm() -> BaseLLM:
     return DeepSeekClient()
 
+
 @lru_cache()
-def get_embedding_model():
+def get_embedding_model() -> Optional[BaseEmbedding]:
     try:
         return BGEM3Local()
-    except Exception as e:
-        logger.warning(f"⚠️ Embedding 模型加载失败: {e}")
+    except Exception as exc:
+        logger.warning("Embedding model initialization failed: %s", exc)
         return None
 
+
 @lru_cache()
-def get_vector_db():
+def get_vector_db() -> Optional[BaseVectorDB]:
     try:
         return ChromaStore()
-    except Exception as e:
-        logger.warning(f"⚠️ ChromaDB 加载失败: {e}")
+    except Exception as exc:
+        logger.warning("Vector DB initialization failed: %s", exc)
         return None
 
+
 @lru_cache()
-def get_keyword_db():
+def get_keyword_db() -> Optional[BaseKeywordDB]:
     try:
         return WhooshStore()
-    except Exception as e:
-        logger.warning(f"⚠️ Whoosh 加载失败: {e}")
+    except Exception as exc:
+        logger.warning("Keyword DB initialization failed: %s", exc)
         return None
 
+
 @lru_cache()
-def get_memory_store():
+def get_memory_store() -> BaseMemoryStore:
     return SQLiteMemoryStore()
 
+
+# -----------------------------------------------------------------------------
+# RAG service graph
+# -----------------------------------------------------------------------------
+
+
 @lru_cache()
-def get_retriever():
-    embed_model = get_embedding_model()
-    v_db = get_vector_db()
-    k_db = get_keyword_db()
-    
-    if not embed_model or not v_db or not k_db:
-        logger.warning("⚠️ 检索核心组件缺失，RAG 功能底层实例初始化为空。")
+def get_reranker() -> LexicalOverlapReranker:
+    return LexicalOverlapReranker()
+
+
+@lru_cache()
+def get_context_packer() -> ContextPacker:
+    return ContextPacker()
+
+
+@lru_cache()
+def get_answer_guard() -> SourceAwareResponseGuard:
+    return SourceAwareResponseGuard()
+
+
+@lru_cache()
+def get_query_rewriter() -> QueryRewriteService:
+    return QueryRewriteService()
+
+
+@lru_cache()
+def get_query_planner() -> QueryPlanner:
+    return QueryPlanner(query_rewriter=get_query_rewriter())
+
+
+@lru_cache()
+def get_retriever() -> Optional[HybridRetriever]:
+    embedding_model = get_embedding_model()
+    vector_db = get_vector_db()
+    keyword_db = get_keyword_db()
+
+    if not embedding_model or not vector_db or not keyword_db:
+        logger.warning(
+            "RAG retriever is unavailable because one or more adapters failed to initialize."
+        )
         return None
-        
+
     return HybridRetriever(
-        vector_db=v_db,
-        keyword_db=k_db,
-        embedding_model=embed_model
+        vector_db=vector_db,
+        keyword_db=keyword_db,
+        embedding_model=embedding_model,
+        query_planner=get_query_planner(),
+        reranker=get_reranker(),
     )
 
+
 @lru_cache()
-def get_session_manager():
+def get_rag_pipeline() -> Optional[RAGPipeline]:
+    retriever = get_retriever()
+    if retriever is None:
+        return None
+
+    return RAGPipeline(
+        retriever=retriever,
+        context_packer=get_context_packer(),
+        answer_guard=get_answer_guard(),
+    )
+
+
+# -----------------------------------------------------------------------------
+# Core services
+# -----------------------------------------------------------------------------
+
+
+@lru_cache()
+def get_session_manager() -> SessionManager:
     return SessionManager(memory_store=get_memory_store())
 
+
+@lru_cache()
+def get_context_engine() -> ContextEngine:
+    return ContextEngine()
+
+
+@lru_cache()
+def get_intent_router() -> IntentRouter:
+    return IntentRouter()
+
+
+@lru_cache()
+def get_profile_extractor() -> ProfileExtractor:
+    extractor = ProfileExtractor(memory_store=get_memory_store())
+    event_bus.subscribe(
+        "conversation.completed",
+        extractor.handle_conversation_completed,
+    )
+    return extractor
+
+
+# -----------------------------------------------------------------------------
+# Agent assembly
+# -----------------------------------------------------------------------------
+
+
+def _build_agent_tools(
+    retriever: Optional[HybridRetriever],
+    rag_pipeline: Optional[RAGPipeline],
+) -> List[Callable[..., Any]]:
+    tools: List[Callable[..., Any]] = [
+        read_local_file,
+        write_local_file,
+        list_sandbox_files,
+        get_weather,
+        execute_python_code,
+        query_business_database,
+    ]
+
+    if retriever is not None:
+        tools.append(
+            KnowledgeBaseTool(
+                retriever=retriever,
+                rag_pipeline=rag_pipeline,
+                collection_name="__all__",
+            ).search
+        )
+
+    return tools
+
+
+@lru_cache()
+def get_tool_registry() -> ToolRegistry:
+    return ToolRegistry.from_callables(
+        tools=_build_agent_tools(get_retriever(), get_rag_pipeline()),
+        policy=ToolPolicy(max_result_chars=4000),
+    )
+
+
+@lru_cache()
+def get_agent_engine() -> AgentEngine:
+    return AgentEngine(
+        llm=get_llm(),
+        tool_registry=get_tool_registry(),
+    )
+
+
+@lru_cache()
+def get_agent_supervisor() -> AgentSupervisor:
+    llm = get_llm()
+    context_engine = get_context_engine()
+    rag_pipeline = get_rag_pipeline()
+
+    return AgentSupervisor(
+        intent_router=get_intent_router(),
+        chat_worker=ChatWorker(llm=llm, context_engine=context_engine),
+        rag_worker=(
+            RAGWorker(
+                llm=llm,
+                context_engine=context_engine,
+                rag_pipeline=rag_pipeline,
+                collection_name="__all__",
+            )
+            if rag_pipeline is not None
+            else None
+        ),
+        tool_worker=ToolAgentWorker(
+            agent_engine=get_agent_engine(),
+            context_engine=context_engine,
+        ),
+    )
+
+
+# -----------------------------------------------------------------------------
+# Application workflows
+# -----------------------------------------------------------------------------
+
+
+@lru_cache()
 def get_chat_app() -> ChatApplication:
+    get_profile_extractor()
     return ChatApplication(
         llm=get_llm(),
         session_manager=get_session_manager(),
-        retriever=get_retriever()
+        context_engine=get_context_engine(),
+        intent_router=get_intent_router(),
+        profile_extractor=get_profile_extractor(),
+        retriever=get_retriever(),
+        rag_pipeline=get_rag_pipeline(),
     )
 
-def get_agent_app() -> AgentApplication:
-    # 🌟 豪华版工具全家桶
-    tools =[
-        read_local_file, 
-        write_local_file, 
-        list_sandbox_files,  # 文件系统三件套
-        get_weather,         # 真实天气
-        execute_python_code, # Python 沙箱
-        query_business_database # 数据库探查
-    ]
-    
-    retriever = get_retriever()
-    if retriever:
-        rag_tool_instance = KnowledgeBaseTool(retriever=retriever)
-        tools.append(rag_tool_instance.search)
-        
-    engine = AgentEngine(llm=get_llm(), tools=tools)
-    return AgentApplication(agent_engine=engine, session_manager=get_session_manager())
 
+@lru_cache()
+def get_agent_app() -> AgentApplication:
+    profile_extractor = get_profile_extractor()
+    return AgentApplication(
+        agent_engine=get_agent_engine(),
+        session_manager=get_session_manager(),
+        context_engine=get_context_engine(),
+        profile_extractor=profile_extractor,
+        supervisor=get_agent_supervisor(),
+    )
+
+
+@lru_cache()
 def get_kb_app() -> KnowledgeBaseApp:
     return KnowledgeBaseApp(
         chunker=DocumentChunker(),
         embedding_model=get_embedding_model(),
         vector_db=get_vector_db(),
-        keyword_db=get_keyword_db()
+        keyword_db=get_keyword_db(),
     )

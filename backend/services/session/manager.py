@@ -1,7 +1,9 @@
 from typing import List, Dict, Any
+from backend.common.event_bus import event_bus
+from backend.domain.entities.tooling import ToolCall
 from backend.domain.interfaces.memory_db import BaseMemoryStore
 from backend.domain.entities.message import Message, AIMessage
-from backend.core.logger import get_logger
+from backend.common.logger import get_logger
 
 logger = get_logger(__name__)
 
@@ -13,6 +15,7 @@ class SessionManager:
     def get_chat_context(self, session_id: str, max_rounds: int = 5) -> List[Dict[str, Any]]:
         history_entities = self.store.get_history(session_id, limit=max_rounds)
         raw_messages =[msg.model_dump(exclude_none=True) for msg in history_entities]
+        raw_messages = [self._normalize_message_for_llm(msg) for msg in raw_messages]
 
         # ==========================================
         # 🛡️ 终极防御：基于状态机的严格历史清洗算法
@@ -65,10 +68,23 @@ class SessionManager:
         return valid_messages
 
     def save_interaction(self, session_id: str, user_query: str, ai_response: str):
+        messages: List[Dict[str, Any]] = []
         if user_query:
             self.store.add_message(session_id, Message(role="user", content=user_query))
+            messages.append({"role": "user", "content": user_query})
         if ai_response:
             self.store.add_message(session_id, Message(role="assistant", content=ai_response))
+            messages.append({"role": "assistant", "content": ai_response})
+        if messages:
+            event_bus.publish(
+                "conversation.completed",
+                {
+                    "session_id": session_id,
+                    "messages": messages,
+                    "user_query": user_query,
+                    "assistant_response": ai_response,
+                },
+            )
 
     def add_messages(self, session_id: str, messages: List[Dict[str, Any]]):
         """将 engine 返回的 Dict 转换为强类型 Message 并入库"""
@@ -79,6 +95,15 @@ class SessionManager:
             else:
                 entity = Message(**msg)
             self.store.add_message(session_id, entity)
+
+        if messages:
+            event_bus.publish(
+                "conversation.completed",
+                {
+                    "session_id": session_id,
+                    "messages": messages,
+                },
+            )
             
         logger.info(f"✅ 已持久化 {len(messages)} 条对话及工具调用轨迹至数据库。")
 
@@ -93,3 +118,12 @@ class SessionManager:
 
     def list_sessions(self) -> List[Dict[str, Any]]:
         return self.store.get_all_sessions()
+
+    def _normalize_message_for_llm(self, msg: Dict[str, Any]) -> Dict[str, Any]:
+        if msg.get("role") == "assistant" and msg.get("tool_calls"):
+            msg = dict(msg)
+            msg["tool_calls"] = [
+                ToolCall.model_validate(tool_call).to_openai_tool_call()
+                for tool_call in msg["tool_calls"]
+            ]
+        return msg
