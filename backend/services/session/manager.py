@@ -4,16 +4,25 @@ from backend.domain.entities.tooling import ToolCall
 from backend.domain.interfaces.memory_db import BaseMemoryStore
 from backend.domain.entities.message import Message, AIMessage
 from backend.common.logger import get_logger
+from backend.services.session.context_window_manager import PriorityContextWindowManager
 
 logger = get_logger(__name__)
 
 class SessionManager:
     """会话上下文管家"""
-    def __init__(self, memory_store: BaseMemoryStore):
+    def __init__(
+        self,
+        memory_store: BaseMemoryStore,
+        context_window_manager: PriorityContextWindowManager | None = None,
+    ):
         self.store = memory_store
+        self.context_window_manager = context_window_manager or PriorityContextWindowManager()
 
     def get_chat_context(self, session_id: str, max_rounds: int = 5) -> List[Dict[str, Any]]:
-        history_entities = self.store.get_history(session_id, limit=max_rounds)
+        history_entities = self.store.get_history(
+            session_id,
+            limit=max(max_rounds * 3, max_rounds),
+        )
         raw_messages =[msg.model_dump(exclude_none=True) for msg in history_entities]
         raw_messages = [self._normalize_message_for_llm(msg) for msg in raw_messages]
 
@@ -65,7 +74,19 @@ class SessionManager:
              while valid_messages and (valid_messages[-1].get("role") == "tool" or "tool_calls" in valid_messages[-1]):
                  valid_messages.pop()
 
-        return valid_messages
+        context_budget = max(1, max_rounds)
+        trimmed_messages = self.context_window_manager.trim(
+            valid_messages,
+            budget=context_budget,
+        )
+        logger.debug(
+            "Context window selected %s/%s messages for session %s with budget=%s",
+            len(trimmed_messages),
+            len(valid_messages),
+            session_id,
+            context_budget,
+        )
+        return trimmed_messages
 
     def save_interaction(self, session_id: str, user_query: str, ai_response: str):
         messages: List[Dict[str, Any]] = []

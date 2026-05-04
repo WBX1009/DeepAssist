@@ -72,6 +72,7 @@ class ChatApplication:
         full_response = ""
         response_chunks: list[str] = []
         should_persist = False
+        history_budget = max(1, history_rounds)
         try:
             mode, intent_decision = self._resolve_mode(mode, query)
             if intent_decision:
@@ -85,7 +86,7 @@ class ChatApplication:
                 logger.info("Entering quick chat mode")
                 history = self.session_mgr.get_chat_context(
                     session_id,
-                    max_rounds=history_rounds,
+                    max_rounds=history_budget,
                 )
                 user_profile = self._render_user_profile(use_user_memory)
                 context = self.context_engine.build_quick_context(
@@ -116,7 +117,7 @@ class ChatApplication:
                     )
                     history = self.session_mgr.get_chat_context(
                         session_id,
-                        max_rounds=history_rounds,
+                        max_rounds=history_budget,
                     )
                     user_profile = self._render_user_profile(use_user_memory)
                     fallback_context = self.context_engine.build_quick_context(
@@ -145,7 +146,7 @@ class ChatApplication:
 
                 history = self.session_mgr.get_chat_context(
                     session_id,
-                    max_rounds=history_rounds,
+                    max_rounds=history_budget,
                 )
                 user_profile = self._render_user_profile(use_user_memory)
                 pipeline_result = self.rag_pipeline.build_context(

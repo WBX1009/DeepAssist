@@ -288,7 +288,7 @@ def render_sidebar() -> None:
         elif st.session_state.nav_tab == "history":
             render_sidebar_history()
         else:
-            render_sidebar_kb()
+            render_sidebar_kb_v2()
 
 
 def render_sidebar_agent_controls() -> None:
@@ -379,6 +379,86 @@ def render_sidebar_kb() -> None:
     st.caption("问答默认使用全部知识库检索；这里仅用于维护单个集合。")
     if st.button("新建知识库", use_container_width=True):
         st.info("多知识库命名空间入口已预留；当前可管理已有集合和默认 tech_docs_kb。")
+
+
+def render_sidebar_kb_v2() -> None:
+    collections_payload = fetch_kb_collections()
+    health_payload = fetch_kb_health(refresh=False)
+
+    collections = collections_payload.get("data", [])
+    collections = collections if isinstance(collections, list) else []
+    health_report = health_payload.get("data", {})
+    health_report = health_report if isinstance(health_report, dict) else {}
+    health_collections = health_report.get("collections", [])
+    health_collections = health_collections if isinstance(health_collections, list) else []
+
+    collection_names = [
+        item.get("collection_name")
+        for item in collections
+        if isinstance(item, dict) and item.get("collection_name")
+    ]
+    if st.session_state.kb_collection not in collection_names and collection_names:
+        st.session_state.kb_collection = collection_names[0]
+
+    st.caption("Knowledge Base")
+    if collection_names:
+        st.selectbox(
+            "Current collection",
+            collection_names,
+            key="kb_collection",
+            label_visibility="collapsed",
+        )
+
+    selected = st.session_state.kb_collection
+    selected_meta = next(
+        (item for item in collections if item.get("collection_name") == selected),
+        {},
+    )
+    selected_health = next(
+        (item for item in health_collections if item.get("collection_name") == selected),
+        {},
+    )
+
+    stores = " + ".join(selected_meta.get("stores", [])) or "Unavailable"
+    file_count = int(selected_meta.get("file_count", 0))
+    chunk_count = int(selected_meta.get("chunk_count", 0))
+    health_status = "Healthy" if selected_health.get("healthy") else "Needs attention"
+    checked_at = health_report.get("checked_at", "--")
+    errors = selected_health.get("errors", []) or []
+
+    st.markdown(
+        f"""
+<div class="panel">
+  <div style="font-weight:800;">{selected or "No collection selected"}</div>
+  <div class="tiny">{file_count} files, {chunk_count} chunks</div>
+  <div style="margin-top:.45rem;">
+    <span class="metric-pill">{stores}</span>
+    <span class="metric-pill">Health: {health_status}</span>
+  </div>
+  <div class="tiny" style="margin-top:.45rem;">Checked: {checked_at}</div>
+  <div class="tiny">Health issues: {len(errors)}</div>
+</div>
+""",
+        unsafe_allow_html=True,
+    )
+
+    refresh_disabled = not bool(collection_names)
+    if st.button("Refresh KB health", use_container_width=True, disabled=refresh_disabled):
+        refreshed = fetch_kb_health(refresh=True)
+        if refreshed.get("status") in {"success", "partial_success"}:
+            st.success("Knowledge-base health report updated.")
+        else:
+            st.error(refreshed.get("message", "Knowledge-base health refresh failed."))
+        st.rerun()
+
+    with st.expander("Health details", expanded=False):
+        st.caption("RAG and Agent retrieval search across all collections by default.")
+        if selected_health:
+            st.json(selected_health)
+        elif collection_names:
+            st.info("No cached health data for the selected collection yet.")
+        else:
+            st.info("No knowledge-base collections found.")
 
 
 def render_home() -> None:

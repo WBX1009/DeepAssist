@@ -43,12 +43,13 @@ class AgentApplication:
         final_answer_accumulated = ""
         persist_messages: list[dict] | None = None
         should_persist_partial = False
+        history_budget = max(1, history_rounds)
         try:
             logger.info("Entering agent mode for session %s", session_id)
 
             history = self.session_mgr.get_chat_context(
                 session_id,
-                max_rounds=history_rounds,
+                max_rounds=history_budget,
             )
             user_profile = (
                 self.profile_extractor.render_profile() if use_user_memory else None

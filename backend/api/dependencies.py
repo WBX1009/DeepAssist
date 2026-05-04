@@ -41,6 +41,7 @@ from backend.services.rag.pipeline import RAGPipeline
 from backend.services.rag.query_planner import QueryPlanner
 from backend.services.rag.query_rewriter import QueryRewriteService
 from backend.services.rag.reranker import LexicalOverlapReranker
+from backend.services.session.context_window_manager import PriorityContextWindowManager
 from backend.services.session.manager import SessionManager
 from backend.common.config import settings
 
@@ -170,7 +171,15 @@ def get_rag_pipeline() -> Optional[RAGPipeline]:
 
 @lru_cache()
 def get_session_manager() -> SessionManager:
-    return SessionManager(memory_store=get_memory_store())
+    return SessionManager(
+        memory_store=get_memory_store(),
+        context_window_manager=get_context_window_manager(),
+    )
+
+
+@lru_cache()
+def get_context_window_manager() -> PriorityContextWindowManager:
+    return PriorityContextWindowManager()
 
 
 @lru_cache()

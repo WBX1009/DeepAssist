@@ -292,6 +292,30 @@ class BackendRegressionTests(unittest.TestCase):
             ],
         )
 
+    def test_priority_context_keeps_profile_turn_under_budget(self):
+        store = FakeMemoryStore()
+        session_manager = SessionManager(store)
+        session_id = "session-priority"
+
+        session_manager.save_interaction(session_id, "hello", "hi")
+        session_manager.save_interaction(session_id, "tell me a joke", "maybe later")
+        session_manager.save_interaction(
+            session_id,
+            "I am a backend engineer, please answer concisely.",
+            "Noted.",
+        )
+        session_manager.save_interaction(session_id, "random follow-up one", "ack one")
+        session_manager.save_interaction(session_id, "random follow-up two", "ack two")
+        session_manager.save_interaction(session_id, "latest production issue?", "latest answer")
+
+        history = session_manager.get_chat_context(session_id, max_rounds=6)
+        user_messages = [message["content"] for message in history if message["role"] == "user"]
+
+        self.assertIn("I am a backend engineer, please answer concisely.", user_messages)
+        self.assertIn("random follow-up two", user_messages)
+        self.assertIn("latest production issue?", user_messages)
+        self.assertNotIn("hello", user_messages)
+
 
 if __name__ == "__main__":
     unittest.main()
