@@ -1,30 +1,28 @@
+from typing import List, Optional
+
 from pydantic import BaseModel, Field
-from typing import List, Optional, Dict, Any
+
+from backend.domain.entities.tooling import ToolCall
+
 
 class Message(BaseModel):
-    """
-    标准的对话消息结构。
-    这个模型将用于 API 的请求/响应体以及内部会话管理。
-    """
-    role: str = Field(..., description="消息发送者角色: 'user', 'assistant', 'system', 'tool'")
-    content: str = Field(..., description="消息的正文内容")
-    name: Optional[str] = Field(default=None, description="当 role 是 'tool' 时，表示工具的名称")
-    tool_call_id: Optional[str] = Field(default=None, description="当 role 是 'tool' 时，对应工具调用的唯一ID")
+    """Canonical chat message used by API, services, and persistence."""
+
+    role: str = Field(..., description="Message role: user, assistant, system, or tool")
+    content: str = Field(..., description="Message content")
+    name: Optional[str] = Field(default=None, description="Tool name for tool messages")
+    tool_call_id: Optional[str] = Field(default=None, description="Matching tool call id")
+
 
 class ChatSession(BaseModel):
-    """
-    一个完整的会话实体，用于前端展示历史聊天列表。
-    """
+    """A complete chat session for history views."""
+
     session_id: str
-    title: str = Field(default="新聊天", description="会话标题（可以由第一句用户提问生成）")
-    messages: List[Message] = Field(default_factory=list, description="会话中的所有消息")
-    
-class ToolCall(BaseModel):
-    """用于表示大模型请求调用工具的结构"""
-    id: str
-    type: str = "function"
-    function: Dict[str, Any]
+    title: str = Field(default="New chat", description="Session title")
+    messages: List[Message] = Field(default_factory=list, description="Session messages")
+
 
 class AIMessage(Message):
-    """扩展标准Message，以支持大模型的工具调用输出"""
-    tool_calls: Optional[List[ToolCall]] = Field(default=None, description="大模型请求的工具调用列表")
+    """Assistant message that may contain tool calls."""
+
+    tool_calls: Optional[List[ToolCall]] = Field(default=None, description="Requested tool calls")
