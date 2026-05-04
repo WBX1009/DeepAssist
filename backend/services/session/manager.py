@@ -7,6 +7,7 @@ from backend.domain.entities.message import AIMessage, Message
 from backend.domain.entities.tooling import ToolCall
 from backend.domain.interfaces.memory_db import BaseMemoryStore
 from backend.services.session.context_window_manager import PriorityContextWindowManager
+from backend.services.session.long_term_memory_recall import LongTermMemoryRecallService
 from backend.services.session.summary_compressor import ConversationSummaryCompressor
 
 logger = get_logger(__name__)
@@ -20,37 +21,68 @@ class SessionManager:
         memory_store: BaseMemoryStore,
         context_window_manager: PriorityContextWindowManager | None = None,
         summary_compressor: ConversationSummaryCompressor | None = None,
+        memory_recall: LongTermMemoryRecallService | None = None,
     ):
         self.store = memory_store
         self.context_window_manager = context_window_manager or PriorityContextWindowManager()
         self.summary_compressor = summary_compressor or ConversationSummaryCompressor()
+        self.memory_recall = memory_recall or LongTermMemoryRecallService(memory_store)
 
     def get_session_history(self, session_id: str, limit: int = 50) -> List[Dict[str, Any]]:
         raw_messages = self._load_and_normalize_history(session_id, limit=max(1, limit))
         return self._sanitize_tool_history(raw_messages)
 
-    def plan_chat_context(self, session_id: str, max_rounds: int = 5) -> ContextWindowPlan:
+    def plan_chat_context(
+        self,
+        session_id: str,
+        max_rounds: int = 5,
+        query: str = "",
+        use_long_term_memory: bool = False,
+    ) -> ContextWindowPlan:
         safe_budget = max(1, max_rounds)
+        recalled_memories = (
+            self._recall_long_term_memories(query, safe_budget)
+            if use_long_term_memory
+            else []
+        )
+        history_budget = max(1, safe_budget - len(recalled_memories))
+
         raw_history = self._load_and_normalize_history(
             session_id,
-            limit=max(safe_budget * 3, safe_budget),
+            limit=max(history_budget * 3, safe_budget),
         )
         valid_messages = self._sanitize_tool_history(raw_history)
-        plan = self.context_window_manager.plan(valid_messages, budget=safe_budget)
+        plan = self.context_window_manager.plan(valid_messages, budget=history_budget)
         if plan.dropped_turns:
             summary = self.summary_compressor.compress(plan.dropped_turns)
             if summary is not None:
                 plan = plan.model_copy(update={"summary": summary})
+        if recalled_memories:
+            plan = plan.model_copy(update={"recalled_memories": recalled_memories, "budget": safe_budget})
+        else:
+            plan = plan.model_copy(update={"budget": safe_budget})
         return plan
 
-    def get_chat_context(self, session_id: str, max_rounds: int = 5) -> List[Dict[str, Any]]:
-        plan = self.plan_chat_context(session_id, max_rounds=max_rounds)
+    def get_chat_context(
+        self,
+        session_id: str,
+        max_rounds: int = 5,
+        query: str = "",
+        use_long_term_memory: bool = False,
+    ) -> List[Dict[str, Any]]:
+        plan = self.plan_chat_context(
+            session_id,
+            max_rounds=max_rounds,
+            query=query,
+            use_long_term_memory=use_long_term_memory,
+        )
         messages = plan.flattened_messages()
         logger.debug(
-            "Context window selected %s messages for session %s under budget=%s; dropped_turns=%s, summary=%s",
+            "Context window selected %s messages for session %s under budget=%s; recalled_memories=%s, dropped_turns=%s, summary=%s",
             len(messages),
             session_id,
             plan.budget,
+            len(plan.recalled_memories),
             len(plan.dropped_turns),
             bool(plan.summary),
         )
@@ -167,3 +199,9 @@ class SessionManager:
             ]
             return normalized
         return msg
+
+    def _recall_long_term_memories(self, query: str, budget: int):
+        if not query.strip() or budget <= 1:
+            return []
+        memory_limit = min(2, max(1, budget // 3))
+        return self.memory_recall.recall(query, max_items=memory_limit)

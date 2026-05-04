@@ -42,6 +42,7 @@ from backend.services.rag.query_planner import QueryPlanner
 from backend.services.rag.query_rewriter import QueryRewriteService
 from backend.services.rag.reranker import LexicalOverlapReranker
 from backend.services.session.context_window_manager import PriorityContextWindowManager
+from backend.services.session.long_term_memory_recall import LongTermMemoryRecallService
 from backend.services.session.manager import SessionManager
 from backend.services.session.summary_compressor import ConversationSummaryCompressor
 from backend.common.config import settings
@@ -176,6 +177,7 @@ def get_session_manager() -> SessionManager:
         memory_store=get_memory_store(),
         context_window_manager=get_context_window_manager(),
         summary_compressor=get_summary_compressor(),
+        memory_recall=get_long_term_memory_recall_service(),
     )
 
 
@@ -187,6 +189,11 @@ def get_context_window_manager() -> PriorityContextWindowManager:
 @lru_cache()
 def get_summary_compressor() -> ConversationSummaryCompressor:
     return ConversationSummaryCompressor()
+
+
+@lru_cache()
+def get_long_term_memory_recall_service() -> LongTermMemoryRecallService:
+    return LongTermMemoryRecallService(get_memory_store())
 
 
 @lru_cache()

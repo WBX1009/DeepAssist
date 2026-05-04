@@ -3,6 +3,7 @@ from typing import Any, Dict, List
 
 from pydantic import BaseModel, Field
 
+from backend.domain.entities.long_term_memory import LongTermMemoryItem
 
 class ContextPriorityBand(str, Enum):
     LOW = "low"
@@ -47,6 +48,7 @@ class ContextWindowPlan(BaseModel):
     selected_turns: List[ContextTurn] = Field(default_factory=list)
     dropped_turns: List[ContextTurn] = Field(default_factory=list)
     summary: ContextSummary | None = None
+    recalled_memories: List[LongTermMemoryItem] = Field(default_factory=list)
 
     @property
     def selected_cost(self) -> int:
@@ -54,6 +56,8 @@ class ContextWindowPlan(BaseModel):
 
     def flattened_messages(self) -> List[Dict[str, Any]]:
         messages: List[Dict[str, Any]] = []
+        for memory in self.recalled_memories:
+            messages.append(memory.to_message())
         if self.summary is not None:
             messages.append(self.summary.to_message())
         for turn in sorted(self.selected_turns, key=lambda item: item.started_at_index):

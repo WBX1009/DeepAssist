@@ -332,6 +332,59 @@ class BackendRegressionTests(unittest.TestCase):
         self.assertEqual([message["role"] for message in history], ["user", "assistant"] * 3)
         self.assertNotIn("[Conversation Summary]", "\n".join(message["content"] for message in history))
 
+    def test_long_term_memory_is_recalled_into_context_window(self):
+        store = FakeMemoryStore()
+        store.set_profile("user_facts", '["I am a backend engineer.", "I prefer concise answers."]')
+        store.set_profile("topics", '["architecture", "rag"]')
+        session_manager = SessionManager(store)
+        session_id = "session-memory"
+
+        session_manager.save_interaction(session_id, "old question", "old answer")
+        session_manager.save_interaction(session_id, "new question", "new answer")
+
+        plan = session_manager.plan_chat_context(
+            session_id,
+            max_rounds=6,
+            query="Please answer like a backend engineer and keep it concise.",
+            use_long_term_memory=True,
+        )
+        flattened = plan.flattened_messages()
+        memory_messages = [
+            message["content"]
+            for message in flattened
+            if message["role"] == "system" and "[Long-Term Memory]" in message["content"]
+        ]
+
+        self.assertTrue(memory_messages)
+        self.assertTrue(any("backend engineer" in message for message in memory_messages))
+        self.assertTrue(any("concise" in message.lower() for message in memory_messages))
+
+    def test_long_term_memory_consumes_budget_but_keeps_recent_turns(self):
+        store = FakeMemoryStore()
+        store.set_profile("user_facts", '["I am a backend engineer."]')
+        session_manager = SessionManager(store)
+        session_id = "session-memory-budget"
+
+        session_manager.save_interaction(session_id, "turn one", "one")
+        session_manager.save_interaction(session_id, "turn two", "two")
+        session_manager.save_interaction(session_id, "turn three", "three")
+        session_manager.save_interaction(session_id, "turn four", "four")
+
+        plan = session_manager.plan_chat_context(
+            session_id,
+            max_rounds=4,
+            query="As a backend engineer, help me with turn four.",
+            use_long_term_memory=True,
+        )
+        user_messages = [
+            message["content"]
+            for message in plan.flattened_messages()
+            if message["role"] == "user"
+        ]
+
+        self.assertTrue(plan.recalled_memories)
+        self.assertIn("turn four", user_messages)
+
 
 if __name__ == "__main__":
     unittest.main()

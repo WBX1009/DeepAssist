@@ -87,8 +87,16 @@ class ChatApplication:
                 context_plan = self.session_mgr.plan_chat_context(
                     session_id,
                     max_rounds=history_budget,
+                    query=query,
+                    use_long_term_memory=use_user_memory,
                 )
                 history = context_plan.flattened_messages()
+                if context_plan.recalled_memories:
+                    yield SSEManager.format_event(
+                        StreamEvent.status(
+                            f"Recalled {len(context_plan.recalled_memories)} long-term memory item(s)."
+                        )
+                    )
                 if context_plan.summary is not None:
                     yield SSEManager.format_event(
                         StreamEvent.status(
@@ -125,8 +133,16 @@ class ChatApplication:
                     context_plan = self.session_mgr.plan_chat_context(
                         session_id,
                         max_rounds=history_budget,
+                        query=query,
+                        use_long_term_memory=use_user_memory,
                     )
                     history = context_plan.flattened_messages()
+                    if context_plan.recalled_memories:
+                        yield SSEManager.format_event(
+                            StreamEvent.status(
+                                f"Recalled {len(context_plan.recalled_memories)} long-term memory item(s)."
+                            )
+                        )
                     if context_plan.summary is not None:
                         yield SSEManager.format_event(
                             StreamEvent.status(
@@ -161,8 +177,16 @@ class ChatApplication:
                 context_plan = self.session_mgr.plan_chat_context(
                     session_id,
                     max_rounds=history_budget,
+                    query=query,
+                    use_long_term_memory=use_user_memory,
                 )
                 history = context_plan.flattened_messages()
+                if context_plan.recalled_memories:
+                    yield SSEManager.format_event(
+                        StreamEvent.status(
+                            f"Recalled {len(context_plan.recalled_memories)} long-term memory item(s)."
+                        )
+                    )
                 if context_plan.summary is not None:
                     yield SSEManager.format_event(
                         StreamEvent.status(
