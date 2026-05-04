@@ -27,6 +27,28 @@ class ContextTurn(BaseModel):
     def flattened_messages(self) -> List[Dict[str, Any]]:
         return list(self.messages)
 
+    def to_trace_data(self) -> Dict[str, Any]:
+        user_preview = ""
+        for message in self.messages:
+            if message.get("role") == "user" and str(message.get("content", "")).strip():
+                user_preview = self._clip(str(message.get("content", "")))
+                break
+        return {
+            "turn_id": self.turn_id,
+            "estimated_cost": self.estimated_cost,
+            "priority_score": self.priority_score,
+            "priority_band": self.priority_band.value,
+            "pinned": self.pinned,
+            "reasons": list(self.reasons),
+            "preview": user_preview,
+        }
+
+    def _clip(self, text: str, limit: int = 90) -> str:
+        compact = " ".join(text.split())
+        if len(compact) <= limit:
+            return compact
+        return compact[: limit - 3] + "..."
+
 
 class ContextSummary(BaseModel):
     """Compressed representation of dropped history turns."""
@@ -39,6 +61,14 @@ class ContextSummary(BaseModel):
 
     def to_message(self) -> Dict[str, Any]:
         return {"role": "system", "content": self.content}
+
+    def to_trace_data(self) -> Dict[str, Any]:
+        return {
+            "dropped_turn_count": self.dropped_turn_count,
+            "dropped_message_count": self.dropped_message_count,
+            "reason_counts": dict(self.reason_counts),
+            "source_turn_ids": list(self.source_turn_ids),
+        }
 
 
 class ContextWindowPlan(BaseModel):
@@ -63,3 +93,25 @@ class ContextWindowPlan(BaseModel):
         for turn in sorted(self.selected_turns, key=lambda item: item.started_at_index):
             messages.extend(turn.flattened_messages())
         return messages
+
+    def to_trace_data(self) -> Dict[str, Any]:
+        return {
+            "budget": self.budget,
+            "selected_cost": self.selected_cost,
+            "selected_turn_count": len(self.selected_turns),
+            "dropped_turn_count": len(self.dropped_turns),
+            "summary_injected": self.summary is not None,
+            "recalled_memory_count": len(self.recalled_memories),
+            "selected_turns": [turn.to_trace_data() for turn in self.selected_turns],
+            "dropped_turns": [turn.to_trace_data() for turn in self.dropped_turns],
+            "recalled_memories": [
+                {
+                    "key": memory.key,
+                    "category": memory.category,
+                    "score": memory.score,
+                    "content": memory.content,
+                }
+                for memory in self.recalled_memories
+            ],
+            "summary": self.summary.to_trace_data() if self.summary is not None else None,
+        }

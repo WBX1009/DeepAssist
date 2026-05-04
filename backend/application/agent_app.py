@@ -54,6 +54,9 @@ class AgentApplication:
                 use_long_term_memory=use_user_memory,
             )
             history = context_plan.flattened_messages()
+            yield SSEManager.format_event(
+                StreamEvent.context_window_trace(context_plan.to_trace_data())
+            )
             if context_plan.recalled_memories:
                 yield SSEManager.format_event(
                     StreamEvent.status(

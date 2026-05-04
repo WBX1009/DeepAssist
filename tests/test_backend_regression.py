@@ -1,3 +1,4 @@
+import json
 import unittest
 from typing import Any
 
@@ -172,7 +173,9 @@ class BackendRegressionTests(unittest.TestCase):
         )
 
         stream = app.stream_chat("session-chat", "remember me", "quick")
-        next(stream)
+        for chunk in stream:
+            if '"event": "message_delta"' in chunk:
+                break
         stream.close()
 
         saved = [message.model_dump() for message in store.messages["session-chat"]]
@@ -193,7 +196,9 @@ class BackendRegressionTests(unittest.TestCase):
         )
 
         stream = app.stream_agent_task("session-agent", "do task")
-        next(stream)
+        for chunk in stream:
+            if '"event": "message_delta"' in chunk:
+                break
         stream.close()
 
         saved = [message.model_dump() for message in store.messages["session-agent"]]
@@ -384,6 +389,69 @@ class BackendRegressionTests(unittest.TestCase):
 
         self.assertTrue(plan.recalled_memories)
         self.assertIn("turn four", user_messages)
+
+    def test_context_window_trace_data_contains_summary_and_memory(self):
+        store = FakeMemoryStore()
+        store.set_profile("user_facts", '["I am a backend engineer."]')
+        session_manager = SessionManager(store)
+        session_id = "session-trace"
+
+        session_manager.save_interaction(session_id, "turn one", "one")
+        session_manager.save_interaction(session_id, "turn two", "two")
+        session_manager.save_interaction(session_id, "turn three", "three")
+        session_manager.save_interaction(session_id, "turn four", "four")
+
+        plan = session_manager.plan_chat_context(
+            session_id,
+            max_rounds=4,
+            query="backend engineer turn four",
+            use_long_term_memory=True,
+        )
+        trace_data = plan.to_trace_data()
+
+        self.assertIn("budget", trace_data)
+        self.assertIn("selected_turns", trace_data)
+        self.assertIn("recalled_memories", trace_data)
+        self.assertEqual(trace_data["recalled_memory_count"], len(plan.recalled_memories))
+        self.assertTrue(trace_data["summary_injected"] or trace_data["dropped_turn_count"] == 0)
+
+    def test_chat_stream_emits_context_window_trace_event(self):
+        store = FakeMemoryStore()
+        store.set_profile("user_facts", '["I am a backend engineer."]')
+        session_manager = SessionManager(store)
+        session_id = "session-chat-trace"
+        session_manager.save_interaction(session_id, "older one", "one")
+        session_manager.save_interaction(session_id, "older two", "two")
+        session_manager.save_interaction(session_id, "older three", "three")
+
+        app = ChatApplication(
+            llm=FakeLLM(["ok"]),
+            session_manager=session_manager,
+            context_engine=ContextEngine(),
+            intent_router=IntentRouter(),
+        )
+
+        events = list(
+            app.stream_chat(
+                session_id,
+                "I am a backend engineer, help now",
+                "quick",
+                history_rounds=4,
+                use_user_memory=True,
+            )
+        )
+        payloads = []
+        for chunk in events:
+            if not chunk.startswith("data: "):
+                continue
+            raw = chunk[6:].strip()
+            if not raw:
+                continue
+            payloads.append(json.loads(raw))
+
+        trace_payloads = [payload for payload in payloads if payload.get("event") == "context_window_trace"]
+        self.assertTrue(trace_payloads)
+        self.assertIn("budget", trace_payloads[0]["data"])
 
 
 if __name__ == "__main__":

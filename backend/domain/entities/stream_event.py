@@ -70,6 +70,10 @@ class StreamEvent(BaseModel):
         return cls(event="citation_trace", data=data)
 
     @classmethod
+    def context_window_trace(cls, data: Dict[str, Any]) -> "StreamEvent":
+        return cls(event="context_window_trace", data=data)
+
+    @classmethod
     def answer_guard(cls, data: Dict[str, Any]) -> "StreamEvent":
         return cls(event="answer_guard", data=data)
 

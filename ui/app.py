@@ -559,7 +559,7 @@ def render_message(message: Dict[str, Any]) -> None:
             st.markdown(content or "")
             events = message.get("events") or []
             if events:
-                render_event_trace(events)
+                render_event_trace_v2(events)
             tool_calls = message.get("tool_calls")
             if tool_calls:
                 with st.expander("工具调用请求", expanded=False):
@@ -631,6 +631,107 @@ def compact_event_summary(events: List[Dict[str, Any]]) -> str:
     return " -> ".join(parts)
 
 
+def render_event_trace_v2(events: List[Dict[str, Any]]) -> None:
+    with st.expander("Runtime Trace", expanded=False):
+        for event in events:
+            event_name = event.get("event")
+            data = event.get("data", {}) or {}
+            if event_name == "supervisor_route":
+                st.markdown(
+                    f"- Route: `{data.get('worker_kind') or data.get('worker')}` "
+                    f"intent=`{data.get('intent')}` confidence=`{data.get('confidence')}`"
+                )
+            elif event_name == "context_window_trace":
+                st.markdown(
+                    f"- Context window: budget=`{data.get('budget', 0)}` "
+                    f"selected_turns=`{data.get('selected_turn_count', 0)}` "
+                    f"dropped_turns=`{data.get('dropped_turn_count', 0)}` "
+                    f"memories=`{data.get('recalled_memory_count', 0)}`"
+                )
+                recalled_memories = data.get("recalled_memories", []) or []
+                if recalled_memories:
+                    st.markdown("Memory recall")
+                    for memory in recalled_memories:
+                        st.markdown(
+                            f"- [{memory.get('category', 'memory')}] {memory.get('content', '')}"
+                        )
+                selected_turns = data.get("selected_turns", []) or []
+                if selected_turns:
+                    st.markdown("Selected turns")
+                    for turn in selected_turns[:4]:
+                        st.markdown(
+                            f"- `{turn.get('turn_id')}` `{turn.get('priority_band')}` "
+                            f"score=`{turn.get('priority_score')}` {turn.get('preview', '')}"
+                        )
+                dropped_turns = data.get("dropped_turns", []) or []
+                if dropped_turns:
+                    st.markdown("Dropped turns")
+                    for turn in dropped_turns[:3]:
+                        st.markdown(
+                            f"- `{turn.get('turn_id')}` `{turn.get('priority_band')}` "
+                            f"{turn.get('preview', '')}"
+                        )
+                summary = data.get("summary")
+                if isinstance(summary, dict):
+                    st.markdown(
+                        f"- Summary injected: dropped_messages=`{summary.get('dropped_message_count', 0)}` "
+                        f"dropped_turns=`{summary.get('dropped_turn_count', 0)}`"
+                    )
+            elif event_name == "retrieval_trace":
+                st.markdown(
+                    f"- Retrieval: hits=`{data.get('hit_count', 0)}` "
+                    f"candidate_k=`{data.get('candidate_k', 0)}` fusion=`{data.get('fusion', 'n/a')}`"
+                )
+            elif event_name == "citation_trace":
+                st.markdown(f"- Citations packed: `{len(data.get('citations', []))}`")
+            elif event_name == "tool_call":
+                st.markdown(f"- Tool call: `{event.get('name')}`")
+                st.json(event.get("args", {}))
+            elif event_name == "tool_result":
+                ok = data.get("success")
+                st.markdown(f"- Tool result: `{event.get('name')}` success=`{ok}`")
+                if data.get("error"):
+                    st.caption(data.get("error"))
+            elif event_name == "answer_guard":
+                st.markdown(
+                    f"- Answer guard: grounded=`{data.get('grounded')}` "
+                    f"warnings=`{data.get('warnings', [])}`"
+                )
+            elif event_name == "self_correction":
+                st.markdown(f"- Self correction: {event.get('message') or data.get('error')}")
+            elif event_name == "reasoning":
+                st.markdown("- Reasoning snippet")
+                st.code(event.get("content", ""), language="text")
+
+
+def compact_event_summary_v2(events: List[Dict[str, Any]]) -> str:
+    if not events:
+        return ""
+    parts: List[str] = []
+    for event in events[-8:]:
+        name = event.get("event")
+        data = event.get("data", {}) or {}
+        if name == "supervisor_route":
+            parts.append(f"route:{data.get('worker_kind') or data.get('worker')}")
+        elif name == "context_window_trace":
+            parts.append(
+                f"context:{data.get('selected_turn_count', 0)}/{data.get('budget', 0)}"
+            )
+        elif name == "retrieval_trace":
+            parts.append(f"retrieval:{data.get('hit_count', 0)}")
+        elif name == "citation_trace":
+            parts.append(f"citations:{len(data.get('citations', []))}")
+        elif name == "tool_call":
+            parts.append(f"tool:{event.get('name')}")
+        elif name == "tool_result":
+            parts.append(f"result:{event.get('name')}")
+        elif name == "answer_guard":
+            parts.append("guard")
+        elif name == "error":
+            parts.append("error")
+    return " -> ".join(parts)
+
+
 def stream_backend_answer(prompt: str) -> Dict[str, Any]:
     if st.session_state.chat_mode == "agent":
         path = "/agent/stream"
@@ -683,6 +784,7 @@ def stream_backend_answer(prompt: str) -> Dict[str, Any]:
 
                 if event_name in {
                     "supervisor_route",
+                    "context_window_trace",
                     "retrieval_trace",
                     "citation_trace",
                     "tool_call",
@@ -705,7 +807,7 @@ def stream_backend_answer(prompt: str) -> Dict[str, Any]:
 
                 if answer:
                     text_box.markdown(answer + "▌")
-                summary = compact_event_summary(events)
+                summary = compact_event_summary_v2(events)
                 if summary:
                     trace_box.markdown(f"<div class='trace-box'>{summary}</div>", unsafe_allow_html=True)
 
