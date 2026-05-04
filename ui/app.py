@@ -145,6 +145,14 @@ def fetch_kb_files(collection_name: Optional[str] = None) -> Dict[str, Any]:
     )
 
 
+def fetch_kb_health(refresh: bool = False) -> Dict[str, Any]:
+    return request_json(
+        "GET",
+        "/kb/health",
+        params={"refresh": refresh},
+    )
+
+
 def delete_kb_file(source_file: str, collection_name: Optional[str] = None) -> Dict[str, Any]:
     encoded = quote(source_file, safe="")
     return request_json(
