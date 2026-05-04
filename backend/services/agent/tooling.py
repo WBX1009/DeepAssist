@@ -92,6 +92,25 @@ class ToolRegistry:
     def openai_schemas(self) -> List[Dict[str, Any]]:
         return [tool.to_openai_schema() for tool in self._tools.values()]
 
+    def describe_tools(self) -> str:
+        if not self._tools:
+            return "No tools are currently registered."
+
+        lines: List[str] = []
+        for spec in sorted(self._tools.values(), key=lambda item: item.name):
+            properties = spec.parameters.get("properties", {})
+            required_args = set(spec.parameters.get("required", []))
+            rendered_args: List[str] = []
+            for name, schema in properties.items():
+                json_type = schema.get("type", "string")
+                marker = "*" if name in required_args else "?"
+                rendered_args.append(f"{name}:{json_type}{marker}")
+
+            args_text = ", ".join(rendered_args) if rendered_args else "no arguments"
+            lines.append(f"- {spec.name}({args_text}): {spec.description}")
+
+        return "\n".join(lines)
+
     def execute(self, tool_call: ToolCall) -> ToolResult:
         spec = self._tools.get(tool_call.name)
         if not spec:

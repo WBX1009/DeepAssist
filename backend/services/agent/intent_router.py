@@ -7,6 +7,18 @@ from backend.domain.entities.intent import IntentDecision, IntentType
 class IntentRouter:
     """Lightweight deterministic intent router for workflow selection."""
 
+    TOOL_INVENTORY_PATTERNS = (
+        r"能调用哪些工具",
+        r"(哪些|什么).*(工具)",
+        r"(工具).*(有哪些|列表|清单|可用|支持|能调用|可调用)",
+    )
+    KB_CATALOG_PATTERNS = (
+        r"(当前|现在|目前).*(知识库|集合|文档|文件)",
+        r"(知识库|集合|文档|文件).*(有哪些|有多少|多少个|列表|清单|状态|上传|接入)",
+        r"(能|可以).*(根据|基于).*(知识库).*(回答|作答|问答)",
+        r"(知识库).*(能|可以).*(回答|作答|问答)",
+    )
+
     RAG_PATTERNS = (
         "\u77e5\u8bc6\u5e93",  # knowledge base
         "\u6587\u6863",  # document
@@ -91,6 +103,14 @@ class IntentRouter:
             ),
             allowed,
         )
+
+    def is_tool_inventory_query(self, query: str) -> bool:
+        text = (query or "").strip().lower()
+        return bool(text and self._match_patterns(text, self.TOOL_INVENTORY_PATTERNS))
+
+    def is_kb_catalog_query(self, query: str) -> bool:
+        text = (query or "").strip().lower()
+        return bool(text and self._match_patterns(text, self.KB_CATALOG_PATTERNS))
 
     def _match_patterns(self, text: str, patterns: Iterable[str]) -> list[str]:
         return [pattern for pattern in patterns if re.search(pattern, text, flags=re.IGNORECASE)]
