@@ -1,5 +1,5 @@
 from abc import ABC, abstractmethod
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Optional
 from backend.domain.entities.message import Message
 
 class BaseMemoryStore(ABC):
@@ -21,4 +21,16 @@ class BaseMemoryStore(ABC):
 
     @abstractmethod
     def get_all_sessions(self) -> List[Dict[str, Any]]:
+        pass
+
+    @abstractmethod
+    def get_profile(self, key: str) -> Optional[str]:
+        pass
+
+    @abstractmethod
+    def set_profile(self, key: str, value: str) -> bool:
+        pass
+
+    @abstractmethod
+    def get_all_profiles(self) -> Dict[str, str]:
         pass

@@ -9,8 +9,9 @@ from jieba.analyse import ChineseAnalyzer
 
 from backend.domain.interfaces.keyword_db import BaseKeywordDB
 from backend.domain.entities.document import DocumentChunk
-from backend.core.config import settings
-from backend.core.logger import get_logger
+from backend.domain.entities.knowledge_base import KnowledgeBaseFile
+from backend.common.config import settings
+from backend.common.logger import get_logger
 
 logger = get_logger(__name__)
 
@@ -79,6 +80,63 @@ class WhooshStore(BaseKeywordDB):
         except Exception as e:
             logger.error(f"Whoosh 写入失败: {e}")
             return False
+
+    def list_sources(self, collection_name: str) -> List[KnowledgeBaseFile]:
+        """Return file-level chunk counts from Whoosh stored fields."""
+        col_dir = self._get_collection_dir(collection_name)
+        if not exists_in(col_dir):
+            return []
+
+        try:
+            ix = self._get_or_open_index(collection_name)
+            if not ix:
+                return []
+
+            source_map: Dict[str, KnowledgeBaseFile] = {}
+            with ix.searcher() as searcher:
+                for fields in searcher.all_stored_fields():
+                    metadata = {}
+                    try:
+                        metadata = json.loads(fields.get("metadata") or "{}")
+                    except Exception:
+                        metadata = {}
+                    source_file = (
+                        fields.get("source_file")
+                        or metadata.get("source_file")
+                        or metadata.get("source")
+                    )
+                    if not source_file:
+                        continue
+
+                    current = source_map.get(source_file)
+                    if current is None:
+                        source_map[source_file] = KnowledgeBaseFile(
+                            source_file=source_file,
+                            chunk_count=1,
+                            metadata={"first_chunk_metadata": metadata},
+                        )
+                        continue
+
+                    source_map[source_file] = current.model_copy(
+                        update={"chunk_count": current.chunk_count + 1}
+                    )
+
+            return sorted(source_map.values(), key=lambda item: item.source_file.lower())
+        except Exception as e:
+            logger.error(f"Whoosh list sources failed: {e}")
+            return []
+
+    def list_collections(self) -> List[str]:
+        try:
+            names = []
+            for entry in os.listdir(self.base_path):
+                col_dir = os.path.join(self.base_path, entry)
+                if os.path.isdir(col_dir) and exists_in(col_dir):
+                    names.append(entry)
+            return sorted(set(names))
+        except Exception as e:
+            logger.error(f"Whoosh list collections failed: {e}")
+            return []
 
     def search(self, collection_name: str, query_text: str, top_k: int) -> List[DocumentChunk]:
         ix = self._get_or_open_index(collection_name)

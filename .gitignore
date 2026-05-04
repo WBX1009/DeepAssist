@@ -67,10 +67,17 @@ tree_output.txt
 test.py
 *.ipynb
 
+
 # =========================
 # workspace（你的实验区）
 # =========================
 workspace/
+demo/
+scripts/
+!scripts/
+scripts/*
+!scripts/test_*.py
+!scripts/test_support.py
 
 # =========================
 # 允许的关键文件（防误杀）

@@ -1,7 +1,7 @@
 import subprocess
 import tempfile
 import os
-from backend.core.logger import get_logger
+from backend.common.logger import get_logger
 
 logger = get_logger(__name__)
 

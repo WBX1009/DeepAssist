@@ -1,19 +1,22 @@
-# 基础框架
+# Core framework
 fastapi
 uvicorn
+python-multipart
+requests
 pydantic>=2.0
 pydantic-settings
 
-# AI / 核心编排
+# AI orchestration
 langchain-core
 langgraph
 openai>=1.0.0
 
-# 检索与向量
+# Retrieval and embeddings
 sentence-transformers
 chromadb
 whoosh
 jieba
+tiktoken
 
-# 展现层
+# Presentation
 streamlit

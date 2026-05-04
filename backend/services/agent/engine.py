@@ -1,124 +1,213 @@
-import json
-import inspect
-from typing import List, Dict, Any, Callable, Iterator
+from typing import Any, Callable, Dict, Iterator, List, Optional
+
+from backend.common.config import settings
+from backend.common.logger import get_logger
+from backend.domain.entities.agent_run import AgentRunConfig, AgentTerminationReason
+from backend.domain.entities.tooling import ToolCall, ToolResult
 from backend.domain.interfaces.llm import BaseLLM
-from backend.core.config import settings
-from backend.core.logger import get_logger
+from backend.services.agent.lifecycle import AgentLifecycle
+from backend.services.agent.tooling import ToolRegistry
 
 logger = get_logger(__name__)
 
+
 class AgentEngine:
-    """
-    原生解耦版 Agent 中枢循环引擎。
-    已修复：大模型在调用工具前的中间发言被静默吞噬的问题。
-    """
-    def __init__(self, llm: BaseLLM, tools: List[Callable]):
+    """ReAct-style agent loop with canonical ToolCall/ToolResult flow."""
+
+    def __init__(
+        self,
+        llm: BaseLLM,
+        tools: Optional[List[Callable[..., Any]]] = None,
+        tool_registry: Optional[ToolRegistry] = None,
+        run_config: Optional[AgentRunConfig] = None,
+    ):
         self.llm = llm
-        self.tools_map = {tool.__name__: tool for tool in tools}
-        self.openai_tools = self._build_tools_schema(tools)
+        self.tool_registry = tool_registry or ToolRegistry.from_callables(tools or [])
+        self.openai_tools = self.tool_registry.openai_schemas()
+        self.run_config = run_config or AgentRunConfig(
+            max_iterations=settings.MAX_AGENT_STEPS,
+            max_tool_errors=3,
+            repeated_tool_call_limit=3,
+        )
 
-    def _build_tools_schema(self, tools: List[Callable]) -> List[Dict[str, Any]]:
-        schemas =[]
-        for tool in tools:
-            sig = inspect.signature(tool)
-            properties = {}
-            required =[]
-            
-            for name, param in sig.parameters.items():
-                # 根据类型提示(Type Hint)动态推断 JSON Schema 类型
-                param_type = "string"
-                if param.annotation == int: param_type = "integer"
-                elif param.annotation == float: param_type = "number"
-                elif param.annotation == bool: param_type = "boolean"
-                
-                properties[name] = {"type": param_type, "description": f"参数 {name}"}
-                
-                # 如果没有默认值，说明是必填项
-                if param.default == inspect.Parameter.empty:
-                    required.append(name)
-                    
-            schemas.append({
-                "type": "function",
-                "function": {
-                    "name": tool.__name__,
-                    "description": tool.__doc__ or f"执行 {tool.__name__} 工具",
-                    "parameters": {
-                        "type": "object",
-                        "properties": properties,
-                        "required": required
-                    }
-                }
-            })
-        return schemas
-
-    def stream_run(self, messages: List[Dict[str, Any]]) -> Iterator[Dict[str, Any]]:
+    def stream_run(
+        self,
+        messages: List[Dict[str, Any]],
+        model_options: Optional[Dict[str, Any]] = None,
+    ) -> Iterator[Dict[str, Any]]:
         current_messages = messages.copy()
-        step = 0
-        
-        while step < settings.MAX_AGENT_STEPS:
-            step += 1
-            yield {"type": "status", "content": f"🔄 开启第 {step} 轮推理..."}
-            
-            response_msg = self.llm.chat(messages=current_messages, tools=self.openai_tools)
+        lifecycle = AgentLifecycle(self.run_config)
+        model_kwargs = {
+            key: value for key, value in (model_options or {}).items() if value is not None
+        }
+
+        while lifecycle.start_iteration():
+            yield {
+                "type": "status",
+                "content": (
+                    f"Starting reasoning step {lifecycle.state.iterations}/"
+                    f"{self.run_config.max_iterations}"
+                ),
+                "state": lifecycle.state.terminal_payload(),
+            }
+
+            try:
+                response_msg = self.llm.chat(
+                    messages=current_messages,
+                    tools=self.openai_tools,
+                    **model_kwargs,
+                )
+            except Exception as exc:
+                logger.error("LLM call failed during agent run: %s", exc)
+                lifecycle.fail(AgentTerminationReason.LLM_ERROR, str(exc))
+                yield self._terminal_error_event(lifecycle)
+                yield self._finish_event(messages, current_messages, lifecycle)
+                return
+
             safe_content = response_msg.content or ""
-            
             if getattr(response_msg, "reasoning_content", None):
                 yield {"type": "reasoning", "content": response_msg.reasoning_content}
-                
-            msg_dict = {"role": "assistant", "content": safe_content}
-            
-            if hasattr(response_msg, "tool_calls") and response_msg.tool_calls:
-                msg_dict["tool_calls"] =[
-                    {
-                        "id": tc.id,
-                        "type": "function",
-                        "function": {
-                            "name": tc.function.name,
-                            "arguments": tc.function.arguments
-                        }
-                    } for tc in response_msg.tool_calls
-                ]
-            current_messages.append(msg_dict)
-            
-            # ==========================================
-            # 🟢 修复漏洞 2：防止 LLM 决定调用工具前的发言被吞噬
-            # ==========================================
-            if msg_dict.get("tool_calls"):
-                if safe_content.strip():
-                    # LLM 在调用工具前说了一句话，必须抛给前端展示
-                    yield {"type": "status", "content": f"🗣️ {safe_content}"}
-            else:
-                # 没有任何工具调用，这是最终结论！
-                yield {"type": "final_answer", "content": safe_content}
-                new_msgs = current_messages[len(messages):]
-                yield {"type": "finish", "new_messages": new_msgs}
+
+            tool_calls = [
+                ToolCall.from_llm_tool_call(tool_call)
+                for tool_call in (getattr(response_msg, "tool_calls", None) or [])
+            ]
+            current_messages.append(self._assistant_message(safe_content, tool_calls))
+
+            if not tool_calls:
+                lifecycle.complete(safe_content)
+                yield {
+                    "type": "final_answer",
+                    "content": safe_content,
+                    "state": lifecycle.state.terminal_payload(),
+                }
+                yield self._finish_event(messages, current_messages, lifecycle)
                 return
-                
-            # 执行工具逻辑 (Execute Phase)
-            for tool_call in msg_dict["tool_calls"]:
-                tool_name = tool_call["function"]["name"]
-                tool_args_str = tool_call["function"]["arguments"]
-                tool_id = tool_call["id"]
-                
-                yield {"type": "tool_call", "name": tool_name, "args": tool_args_str}
-                
-                try:
-                    args = json.loads(tool_args_str)
-                    target_func = self.tools_map.get(tool_name)
-                    observation = target_func(**args) if target_func else f"错误: 找不到可用工具 {tool_name}"
-                except Exception as e:
-                    observation = f"工具执行异常: {str(e)}"
-                    logger.error(observation)
-                    
-                yield {"type": "tool_result", "name": tool_name, "content": str(observation)}
-                
-                current_messages.append({
-                    "role": "tool",
-                    "tool_call_id": tool_id,
-                    "name": tool_name,
-                    "content": str(observation)
-                })
-                
-        yield {"type": "error", "content": f"达到最大步数 ({settings.MAX_AGENT_STEPS}) 限制，强制终止。"}
-        new_msgs = current_messages[len(messages):]
-        yield {"type": "finish", "new_messages": new_msgs}
+
+            if safe_content.strip():
+                yield {"type": "status", "content": safe_content}
+
+            if lifecycle_error := lifecycle.guard_tool_phase():
+                for pending_call in tool_calls:
+                    result = ToolResult.lifecycle_error(
+                        pending_call,
+                        lifecycle_error,
+                        metadata=lifecycle.state.terminal_payload(),
+                    )
+                    yield self._tool_result_event(result)
+                    current_messages.append(result.to_tool_message())
+
+                yield self._terminal_error_event(lifecycle)
+                yield self._finish_event(messages, current_messages, lifecycle)
+                return
+
+            for tool_call in tool_calls:
+                yield {
+                    "type": "tool_call",
+                    "name": tool_call.name,
+                    "args": tool_call.args,
+                    "tool_call_id": tool_call.id,
+                    "data": tool_call.to_stream_data(),
+                }
+
+                tool_result = self._execute_tool_call(tool_call, lifecycle)
+                yield self._tool_result_event(tool_result)
+                current_messages.append(tool_result.to_tool_message())
+
+                if lifecycle.state.is_terminal:
+                    yield self._terminal_error_event(lifecycle)
+                    yield self._finish_event(messages, current_messages, lifecycle)
+                    return
+
+                if lifecycle.record_tool_result(tool_result):
+                    yield self._terminal_error_event(lifecycle)
+                    yield self._finish_event(messages, current_messages, lifecycle)
+                    return
+
+                if not tool_result.success:
+                    yield self._self_correction_event(tool_result, lifecycle)
+
+        yield self._terminal_error_event(lifecycle)
+        yield self._finish_event(messages, current_messages, lifecycle)
+
+    def _execute_tool_call(
+        self,
+        tool_call: ToolCall,
+        lifecycle: AgentLifecycle,
+    ) -> ToolResult:
+        if tool_call.validation_error:
+            return ToolResult.invalid_arguments(tool_call, tool_call.validation_error)
+
+        repeated_call_error = lifecycle.record_tool_call(tool_call)
+        if repeated_call_error:
+            return repeated_call_error
+
+        return self.tool_registry.execute(tool_call)
+
+    def _assistant_message(
+        self,
+        safe_content: str,
+        tool_calls: List[ToolCall],
+    ) -> Dict[str, Any]:
+        msg_dict: Dict[str, Any] = {"role": "assistant", "content": safe_content}
+        if tool_calls:
+            msg_dict["tool_calls"] = [
+                tool_call.to_openai_tool_call() for tool_call in tool_calls
+            ]
+        return msg_dict
+
+    def _tool_result_event(self, tool_result: ToolResult) -> Dict[str, Any]:
+        payload = tool_result.to_stream_event().to_payload()
+        return {
+            "type": payload["event"],
+            "name": payload.get("name", tool_result.name),
+            "content": payload.get("content", tool_result.to_observation()),
+            "success": tool_result.success,
+            "error": tool_result.error,
+            "tool_call_id": tool_result.tool_call_id,
+            "metadata": tool_result.metadata,
+            "data": payload.get("data", {}),
+        }
+
+    def _terminal_error_event(self, lifecycle: AgentLifecycle) -> Dict[str, Any]:
+        payload = lifecycle.state.terminal_payload()
+        return {
+            "type": "error",
+            "content": lifecycle.state.error or "Agent run stopped.",
+            "status": payload["status"],
+            "termination_reason": payload["termination_reason"],
+            "state": payload,
+        }
+
+    def _self_correction_event(
+        self,
+        tool_result: ToolResult,
+        lifecycle: AgentLifecycle,
+    ) -> Dict[str, Any]:
+        return {
+            "type": "self_correction",
+            "content": (
+                "Tool call failed; the error observation was returned to the model "
+                "for bounded self-correction."
+            ),
+            "tool_call_id": tool_result.tool_call_id,
+            "name": tool_result.name,
+            "error": tool_result.error,
+            "state": lifecycle.state.terminal_payload(),
+        }
+
+    def _finish_event(
+        self,
+        initial_messages: List[Dict[str, Any]],
+        current_messages: List[Dict[str, Any]],
+        lifecycle: AgentLifecycle,
+    ) -> Dict[str, Any]:
+        return {
+            "type": "finish",
+            "new_messages": current_messages[len(initial_messages) :],
+            "status": lifecycle.state.status.value,
+            "termination_reason": lifecycle.state.termination_reason.value
+            if lifecycle.state.termination_reason
+            else None,
+            "state": lifecycle.state.terminal_payload(),
+        }

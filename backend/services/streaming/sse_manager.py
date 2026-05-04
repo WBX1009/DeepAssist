@@ -1,24 +1,25 @@
 import json
+from typing import Any, Dict, Union
+
+from backend.domain.entities.stream_event import StreamEvent
+
 
 class SSEManager:
-    """SSE 流式协议封装工具"""
-    
+    """SSE transport wrapper for structured JSON events."""
+
+    @staticmethod
+    def format_event(event: Union[StreamEvent, Dict[str, Any]]) -> str:
+        payload = event.to_payload() if isinstance(event, StreamEvent) else event
+        return f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"
+
     @staticmethod
     def format_chunk(text: str) -> str:
-        """
-        将文本块包装为标准 SSE 格式: `data: {"content": "..."}\n\n`
-        使用 JSON 序列化是为了安全地转义换行符和引号。
-        """
-        payload = json.dumps({"content": text}, ensure_ascii=False)
-        return f"data: {payload}\n\n"
+        return SSEManager.format_event(StreamEvent.message_delta(text))
 
     @staticmethod
     def format_end() -> str:
-        """发送结束信号"""
-        return "data:[DONE]\n\n"
-        
+        return SSEManager.format_event(StreamEvent.done())
+
     @staticmethod
     def format_error(err_msg: str) -> str:
-        """发送错误信号"""
-        payload = json.dumps({"error": err_msg}, ensure_ascii=False)
-        return f"data: {payload}\n\n"
+        return SSEManager.format_event(StreamEvent.error(err_msg))

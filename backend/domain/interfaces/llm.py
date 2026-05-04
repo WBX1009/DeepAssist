@@ -1,5 +1,5 @@
 from abc import ABC, abstractmethod
-from typing import List, Dict, Any, Iterator
+from typing import Any, Dict, Iterator, List, Optional
 
 class BaseLLM(ABC):
     """
@@ -8,11 +8,24 @@ class BaseLLM(ABC):
     """
     
     @abstractmethod
-    def chat(self, messages: List[Dict[str, Any]], tools: List[Any] = None) -> Any:
+    def chat(
+        self,
+        messages: List[Dict[str, Any]],
+        tools: Optional[List[Any]] = None,
+        model_name: Optional[str] = None,
+        temperature: Optional[float] = None,
+        top_p: Optional[float] = None,
+    ) -> Any:
         """非流式对话，支持传入工具集合"""
         pass
         
     @abstractmethod
-    def chat_stream(self, messages: List[Dict[str, Any]]) -> Iterator[str]:
+    def chat_stream(
+        self,
+        messages: List[Dict[str, Any]],
+        model_name: Optional[str] = None,
+        temperature: Optional[float] = None,
+        top_p: Optional[float] = None,
+    ) -> Iterator[str]:
         """流式对话输出（用于 SSE）"""
         pass

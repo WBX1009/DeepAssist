@@ -17,8 +17,8 @@ os.environ["CUDA_VISIBLE_DEVICES"] = "2"
 project_root = str(Path(__file__).resolve().parent.parent)
 if project_root not in sys.path: sys.path.append(project_root)
 
-from backend.core.config import settings
-from backend.core.logger import get_logger
+from backend.common.config import settings
+from backend.common.logger import get_logger
 from backend.domain.entities.document import DocumentChunk
 from backend.infrastructure.embeddings.bge_m3_local import BGEM3Local
 from backend.infrastructure.databases.chroma_store import ChromaStore
@@ -54,11 +54,30 @@ def generate_structural_id(file_path: str, index: int, sub_type: str = "") -> st
     raw_str = f"{file_path}_{index}_{sub_type}"
     return hashlib.md5(raw_str.encode('utf-8')).hexdigest()
 
+
+def sanitize_metadata(metadata: dict) -> dict:
+    sanitized = {}
+    for key, value in metadata.items():
+        if value is None:
+            continue
+        if isinstance(value, (str, int, float, bool)):
+            sanitized[key] = value
+        elif isinstance(value, (list, tuple)):
+            sanitized[key] = [str(item) for item in value if item is not None]
+        elif isinstance(value, dict):
+            sanitized[key] = {
+                str(inner_key): str(inner_value)
+                for inner_key, inner_value in value.items()
+                if inner_value is not None
+            }
+        else:
+            sanitized[key] = str(value)
+    return sanitized
+
 class ProgressManager:
     def __init__(self):
-        db_dir = Path(project_root) / "data" / "application_db"
-        db_dir.mkdir(parents=True, exist_ok=True)
-        self.progress_file = db_dir / "ingest_progress.json"
+        self.progress_file = Path(settings.INGEST_PROGRESS_PATH)
+        self.progress_file.parent.mkdir(parents=True, exist_ok=True)
         self.progress = self._load()
 
     def _load(self) -> dict:
@@ -86,7 +105,13 @@ def adapter_medical(file_path: str, start_idx: int) -> Iterator[Tuple[DocumentCh
             try:
                 data = json.loads(line)
                 content = f"Q: {data.get('instruction', '') + data.get('input', '')}\nA: {data.get('output', '')}"
-                yield DocumentChunk(id=generate_structural_id(file_path, idx), content=content, metadata={"source_file": file_path, "domain": "medical", "type": "qa"}), idx
+                yield DocumentChunk(
+                    id=generate_structural_id(file_path, idx),
+                    content=content,
+                    metadata=sanitize_metadata(
+                        {"source_file": file_path, "domain": "medical", "type": "qa"}
+                    ),
+                ), idx
             except: continue
 
 def adapter_legal(file_path: str, start_idx: int) -> Iterator[Tuple[DocumentChunk, int]]:
@@ -98,7 +123,13 @@ def adapter_legal(file_path: str, start_idx: int) -> Iterator[Tuple[DocumentChun
             try:
                 data = json.loads(line)
                 content = f"Q: {data.get('input', '')}\nA: {data.get('output', '')}"
-                yield DocumentChunk(id=data.get("id", generate_structural_id(file_path, idx)), content=content, metadata={"source_file": file_path, "domain": "legal", "type": "qa"}), idx
+                yield DocumentChunk(
+                    id=data.get("id", generate_structural_id(file_path, idx)),
+                    content=content,
+                    metadata=sanitize_metadata(
+                        {"source_file": file_path, "domain": "legal", "type": "qa"}
+                    ),
+                ), idx
             except: continue
 
 def adapter_financial(file_path: str, start_idx: int) -> Iterator[Tuple[DocumentChunk, int]]:
@@ -114,7 +145,13 @@ def adapter_financial(file_path: str, start_idx: int) -> Iterator[Tuple[Document
             clean_output = re.sub(r'\[Calculator.*?\]', '', raw_output)
 
             content = f"Q: {instruction + input_text}\nA: {clean_output}"
-            yield DocumentChunk(id=generate_structural_id(file_path, idx), content=content, metadata={"source_file": file_path, "domain": "finance", "type": "qa"}), idx
+            yield DocumentChunk(
+                id=generate_structural_id(file_path, idx),
+                content=content,
+                metadata=sanitize_metadata(
+                    {"source_file": file_path, "domain": "finance", "type": "qa"}
+                ),
+            ), idx
 
 def adapter_enron(file_path: str, start_idx: int) -> Iterator[Tuple[DocumentChunk, int]]:
     chunker = DocumentChunker()
@@ -127,10 +164,20 @@ def adapter_enron(file_path: str, start_idx: int) -> Iterator[Tuple[DocumentChun
         questions, gold_answers = row.get("questions",[]), row.get("gold_answers",[])
         if isinstance(questions, (list, tuple)) and isinstance(gold_answers, (list, tuple)):
             for qa_idx, (q, a) in enumerate(zip(questions, gold_answers)):
-                yield DocumentChunk(id=generate_structural_id(file_path, row_idx, f"qa_{qa_idx}"), content=f"Q: {q}\nA: {a}", metadata={"source_file": file_path, "domain": "office", "type": "qa"}), row_idx
+                yield DocumentChunk(
+                    id=generate_structural_id(file_path, row_idx, f"qa_{qa_idx}"),
+                    content=f"Q: {q}\nA: {a}",
+                    metadata=sanitize_metadata(
+                        {"source_file": file_path, "domain": "office", "type": "qa"}
+                    ),
+                ), row_idx
         for chunk_idx, c in enumerate(chunker.split_markdown(email_content, source_name="enron")):
             c.id = generate_structural_id(file_path, row_idx, f"email_chunk_{chunk_idx}")
-            c.metadata.update({"source_file": file_path, "domain": "office", "type": "email"})
+            c.metadata.update(
+                sanitize_metadata(
+                    {"source_file": file_path, "domain": "office", "type": "email"}
+                )
+            )
             yield c, row_idx
 
 # ==========================================

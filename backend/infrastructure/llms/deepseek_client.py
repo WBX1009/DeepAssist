@@ -1,10 +1,9 @@
-import os
-from typing import List, Dict, Any, Iterator
+from typing import Any, Dict, Iterator, List, Optional
 from openai import OpenAI
 
 from backend.domain.interfaces.llm import BaseLLM
-from backend.core.config import settings
-from backend.core.logger import get_logger
+from backend.common.config import settings
+from backend.common.logger import get_logger
 
 logger = get_logger(__name__)
 
@@ -29,16 +28,29 @@ class DeepSeekClient(BaseLLM):
         )
         logger.info(f"✅ DeepSeekClient 初始化完成，当前指定模型: {self.model_name}")
 
-    def chat(self, messages: List[Dict[str, Any]], tools: List[Any] = None) -> Any:
+    def chat(
+        self,
+        messages: List[Dict[str, Any]],
+        tools: Optional[List[Any]] = None,
+        model_name: Optional[str] = None,
+        temperature: Optional[float] = None,
+        top_p: Optional[float] = None,
+    ) -> Any:
         """
         非流式对话，支持传入工具 (Tool Calling / Function Calling)
         """
         try:
+            resolved_model = self._resolve_model_name(model_name)
+            if tools and resolved_model == settings.LLM_REASONER_MODEL:
+                logger.warning("DeepSeek reasoner does not support tool calls; falling back to %s", settings.LLM_CHAT_MODEL)
+                resolved_model = settings.LLM_CHAT_MODEL
             kwargs = {
-                "model": self.model_name,
+                "model": resolved_model,
                 "messages": messages,
-                "temperature": 0.7,
+                "temperature": self._resolve_temperature(temperature),
             }
+            if top_p is not None:
+                kwargs["top_p"] = float(top_p)
             # 如果存在工具，则绑定工具（注：deepseek-reasoner 暂不支持 tool_calls，这里由业务层控制）
             if tools:
                 kwargs["tools"] = tools
@@ -50,34 +62,46 @@ class DeepSeekClient(BaseLLM):
             logger.error(f"DeepSeek 接口调用失败: {str(e)}")
             raise e
 
-    def chat_stream(self, messages: List[Dict[str, Any]]) -> Iterator[str]:
+    def chat_stream(
+        self,
+        messages: List[Dict[str, Any]],
+        model_name: Optional[str] = None,
+        temperature: Optional[float] = None,
+        top_p: Optional[float] = None,
+    ) -> Iterator[str]:
         try:
-            response = self.client.chat.completions.create(
-                model=self.model_name, messages=messages, stream=True, temperature=0.7
-            )
+            kwargs = {
+                "model": self._resolve_model_name(model_name),
+                "messages": messages,
+                "stream": True,
+                "temperature": self._resolve_temperature(temperature),
+            }
+            if top_p is not None:
+                kwargs["top_p"] = float(top_p)
+            response = self.client.chat.completions.create(**kwargs)
             
-            is_thinking = False
             for chunk in response:
                 delta = chunk.choices[0].delta
-                
-                # 处理思维链内容 (Reasoner专属)
-                reasoning = getattr(delta, 'reasoning_content', None)
-                if reasoning:
-                    if not is_thinking:
-                        yield "\n```thought\n"  # 思考开始标记 (前端可以用 markdown 渲染成折叠框)
-                        is_thinking = True
-                    yield reasoning
-                
-                # 处理正式回复内容
                 if delta.content:
-                    if is_thinking:
-                        yield "\n```\n\n"  # 思考结束标记
-                        is_thinking = False
                     yield delta.content
-                    
-            if is_thinking: # 兜底，防止流意外中断没有闭合标记
-                yield "\n```\n\n"
                 
         except Exception as e:
             logger.error(f"DeepSeek 流式输出失败: {str(e)}")
-            yield f"\n[模型响应中断: {str(e)}]"
+            raise e
+
+    def _resolve_model_name(self, model_name: Optional[str]) -> str:
+        requested = (model_name or self.model_name or "").strip()
+        normalized = requested.lower()
+        if normalized in {"deepseek-chat", "deepseek chat", "chat"}:
+            return settings.LLM_CHAT_MODEL
+        if normalized in {"deepseek-reasoner", "deepseek reasoner", "reasoner"}:
+            return settings.LLM_REASONER_MODEL
+        if "glm" in normalized or "智谱" in requested:
+            logger.warning("Zhipu model [%s] is not configured; falling back to %s", requested, self.model_name)
+            return self.model_name
+        return requested or self.model_name
+
+    def _resolve_temperature(self, temperature: Optional[float]) -> float:
+        if temperature is None:
+            return 0.7
+        return max(0.0, min(2.0, float(temperature)))
