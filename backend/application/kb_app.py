@@ -3,6 +3,7 @@ from backend.domain.entities.knowledge_base import KnowledgeBaseFile
 from backend.domain.interfaces.embedding import BaseEmbedding
 from backend.domain.interfaces.keyword_db import BaseKeywordDB
 from backend.domain.interfaces.vector_db import BaseVectorDB
+from backend.infrastructure.databases.vector_index_health import VectorIndexHealthInspector
 from backend.services.rag.chunking import DocumentChunker
 
 logger = get_logger(__name__)
@@ -17,11 +18,13 @@ class KnowledgeBaseApp:
         embedding_model: BaseEmbedding | None,
         vector_db: BaseVectorDB | None,
         keyword_db: BaseKeywordDB | None,
+        health_inspector: VectorIndexHealthInspector | None = None,
     ):
         self.chunker = chunker
         self.embedding = embedding_model
         self.vector_db = vector_db
         self.keyword_db = keyword_db
+        self.health_inspector = health_inspector
 
     def _rollback_vector_write(self, collection_name: str, file_name: str) -> bool:
         if self.vector_db is None:
@@ -144,6 +147,51 @@ class KnowledgeBaseApp:
             "data": collections,
             "errors": errors,
         }
+
+    def get_health_report(
+        self,
+        refresh: bool = False,
+        collections: list[str] | None = None,
+    ) -> dict:
+        if self.health_inspector is None:
+            return {
+                "status": "error",
+                "message": "Knowledge-base health inspector is unavailable",
+                "data": {},
+            }
+
+        cached_report = self.health_inspector.load_report()
+        if not refresh and cached_report is not None:
+            return {
+                "status": "success",
+                "source": "cached",
+                "data": cached_report.model_dump(),
+            }
+
+        try:
+            report = self.health_inspector.inspect(
+                collections=collections,
+                persist=True,
+            )
+            return {
+                "status": "success",
+                "source": "live",
+                "data": report.model_dump(),
+            }
+        except Exception as exc:
+            logger.error("Failed to refresh KB health report: %s", exc)
+            if cached_report is not None:
+                return {
+                    "status": "partial_success",
+                    "source": "cached",
+                    "message": f"Live refresh failed: {exc}",
+                    "data": cached_report.model_dump(),
+                }
+            return {
+                "status": "error",
+                "message": f"Knowledge-base health check failed: {exc}",
+                "data": {},
+            }
 
     def delete_file(
         self,

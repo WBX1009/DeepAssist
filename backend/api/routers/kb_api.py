@@ -43,6 +43,18 @@ def list_collections(
     return app.list_collections()
 
 
+@router.get("/health")
+def get_health_report(
+    refresh: bool = Query(default=False),
+    collection_name: list[str] | None = Query(default=None),
+    app: KnowledgeBaseApp = Depends(get_kb_app),
+) -> dict:
+    return app.get_health_report(
+        refresh=refresh,
+        collections=collection_name,
+    )
+
+
 @router.delete("/files/{source_file:path}")
 def delete_file(
     source_file: str,
