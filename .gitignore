@@ -66,6 +66,9 @@ code_dump.txt
 tree_output.txt
 test.py
 *.ipynb
+tests/
+vector_index_doctor.py
+
 
 # =========================
 # workspace（你的实验区）
@@ -73,6 +76,10 @@ test.py
 workspace/
 demo/
 scripts/
+!scripts/
+scripts/*
+!scripts/test_*.py
+!scripts/test_support.py
 
 # =========================
 # 允许的关键文件（防误杀）
