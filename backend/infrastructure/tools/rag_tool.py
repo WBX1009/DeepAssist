@@ -18,7 +18,8 @@ class KnowledgeBaseTool:
         self.rag_pipeline = rag_pipeline
         self.collection_name = collection_name
 
-    def search(self, query: str) -> str:
+    def search_knowledge_base(self, query: str) -> str:
+        """Search the connected knowledge bases for evidence relevant to the query."""
         logger.info("[Tool] Agent KB search: %s", query)
         try:
             docs = self._retrieve(query)
@@ -51,3 +52,7 @@ class KnowledgeBaseTool:
             self.collection_name,
             query,
         ).documents
+
+    def search(self, query: str) -> str:
+        """Backward-compatible alias for legacy tests and callers."""
+        return self.search_knowledge_base(query)

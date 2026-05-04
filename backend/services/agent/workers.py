@@ -155,7 +155,24 @@ class ToolAgentWorker(BaseAgentWorker):
             use_user_memory=bool(user_profile),
             user_profile=user_profile,
         )
+        messages = list(context.messages)
+        tool_inventory = self.agent_engine.tool_registry.describe_tools()
+        inventory_message = {
+            "role": "system",
+            "content": (
+                "Registered tools are listed below. Do not invent tools that are not in this list.\n"
+                "For questions about which knowledge bases are connected, use "
+                "`list_knowledge_base_collections` or `list_knowledge_base_files`.\n"
+                "For questions that need evidence from indexed content, use "
+                "`search_knowledge_base`.\n\n"
+                f"{tool_inventory}"
+            ),
+        }
+        if messages and messages[0].get("role") == "system":
+            messages.insert(1, inventory_message)
+        else:
+            messages.insert(0, inventory_message)
         yield from self.agent_engine.stream_run(
-            context.messages,
+            messages,
             model_options=model_options,
         )

@@ -4,7 +4,7 @@ from backend.domain.entities.agent_worker import (
     AgentWorkerType,
     SupervisorDecision,
 )
-from backend.domain.entities.intent import IntentType
+from backend.domain.entities.intent import IntentDecision, IntentType
 from backend.services.agent.intent_router import IntentRouter
 from backend.services.agent.workers import BaseAgentWorker
 
@@ -25,6 +25,34 @@ class AgentSupervisor:
         self.tool_worker = tool_worker
 
     def decide(self, query: str) -> SupervisorDecision:
+        if self.intent_router.is_tool_inventory_query(query):
+            intent = IntentDecision(
+                intent=IntentType.AGENT,
+                confidence=0.95,
+                reason="tool inventory query detected",
+                signals=["tool_inventory"],
+            )
+            return SupervisorDecision(
+                worker=AgentWorkerType.TOOL,
+                intent=intent,
+                reason="tool inventory query detected; routed to tool_agent_worker",
+                signals=intent.signals,
+            )
+
+        if self.intent_router.is_kb_catalog_query(query):
+            intent = IntentDecision(
+                intent=IntentType.AGENT,
+                confidence=0.93,
+                reason="knowledge-base catalog or capability query detected",
+                signals=["kb_catalog"],
+            )
+            return SupervisorDecision(
+                worker=AgentWorkerType.TOOL,
+                intent=intent,
+                reason="knowledge-base catalog query detected; routed to tool_agent_worker",
+                signals=intent.signals,
+            )
+
         allowed = {IntentType.CHAT, IntentType.AGENT}
         if self.rag_worker is not None:
             allowed.add(IntentType.RAG)

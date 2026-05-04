@@ -22,6 +22,7 @@ from backend.infrastructure.tools.file_ops import (
     read_local_file,
     write_local_file,
 )
+from backend.infrastructure.tools.kb_catalog_tool import KnowledgeBaseCatalogTool
 from backend.infrastructure.tools.python_ops import execute_python_code
 from backend.infrastructure.tools.rag_tool import KnowledgeBaseTool
 from backend.infrastructure.tools.sql_ops import query_business_database
@@ -224,6 +225,7 @@ def get_profile_extractor() -> ProfileExtractor:
 def _build_agent_tools(
     retriever: Optional[HybridRetriever],
     rag_pipeline: Optional[RAGPipeline],
+    kb_app: KnowledgeBaseApp,
 ) -> List[Callable[..., Any]]:
     tools: List[Callable[..., Any]] = [
         read_local_file,
@@ -233,6 +235,13 @@ def _build_agent_tools(
         execute_python_code,
         query_business_database,
     ]
+    kb_catalog_tool = KnowledgeBaseCatalogTool(kb_app)
+    tools.extend(
+        [
+            kb_catalog_tool.list_knowledge_base_collections,
+            kb_catalog_tool.list_knowledge_base_files,
+        ]
+    )
 
     if retriever is not None:
         tools.append(
@@ -240,7 +249,7 @@ def _build_agent_tools(
                 retriever=retriever,
                 rag_pipeline=rag_pipeline,
                 collection_name="__all__",
-            ).search
+            ).search_knowledge_base
         )
 
     return tools
@@ -249,7 +258,7 @@ def _build_agent_tools(
 @lru_cache()
 def get_tool_registry() -> ToolRegistry:
     return ToolRegistry.from_callables(
-        tools=_build_agent_tools(get_retriever(), get_rag_pipeline()),
+        tools=_build_agent_tools(get_retriever(), get_rag_pipeline(), get_kb_app()),
         policy=ToolPolicy(max_result_chars=4000),
     )
 

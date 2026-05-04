@@ -7,16 +7,20 @@ from backend.application.agent_app import AgentApplication
 from backend.application.chat_app import ChatApplication
 from backend.application.kb_app import KnowledgeBaseApp
 from backend.domain.entities.agent_run import AgentRunConfig
+from backend.domain.entities.agent_worker import AgentWorkerType
 from backend.domain.entities.document import DocumentChunk
 from backend.domain.entities.knowledge_base import KnowledgeBaseHealthReport
 from backend.domain.entities.rag_pipeline import RAGPipelineResult
 from backend.domain.entities.retrieval import Citation, RAGContextPack, RerankTrace, RetrievalResult
 from backend.domain.entities.tooling import ToolCall
 from backend.domain.interfaces.memory_db import BaseMemoryStore
+from backend.infrastructure.tools.kb_catalog_tool import KnowledgeBaseCatalogTool
 from backend.infrastructure.tools.rag_tool import KnowledgeBaseTool
 from backend.services.agent.engine import AgentEngine
 from backend.services.agent.intent_router import IntentRouter
+from backend.services.agent.supervisor import AgentSupervisor
 from backend.services.agent.tooling import ToolRegistry
+from backend.services.agent.workers import ToolAgentWorker
 from backend.services.context_engine import ContextEngine
 from backend.services.session.manager import SessionManager
 
@@ -174,6 +178,39 @@ class FakeHealthInspector:
             }
         )
         return self.live_report
+
+
+class FakeKBApp:
+    def list_collections(self):
+        return {
+            "status": "success",
+            "data": [
+                {
+                    "collection_name": "medical_kb",
+                    "file_count": 2,
+                    "chunk_count": 18,
+                    "stores": ["keyword", "vector"],
+                },
+                {
+                    "collection_name": "tech_docs_kb",
+                    "file_count": 4,
+                    "chunk_count": 36,
+                    "stores": ["keyword", "vector"],
+                },
+            ],
+        }
+
+    def list_files(self, collection_name: str = "tech_docs_kb"):
+        return {
+            "status": "success",
+            "data": [
+                {
+                    "source_file": "guide.md",
+                    "chunk_count": 12,
+                    "consistent": True,
+                }
+            ],
+        }
 
 
 class BackendRegressionTests(unittest.TestCase):
@@ -551,6 +588,61 @@ class BackendRegressionTests(unittest.TestCase):
         self_corrections = [event for event in events if event.get("type") == "self_correction"]
         self.assertTrue(self_corrections)
         self.assertEqual(self_corrections[0]["data"].get("repair_strategy"), "fix_arguments")
+
+    def test_agent_supervisor_routes_kb_catalog_queries_to_tool_worker(self):
+        supervisor = AgentSupervisor(
+            intent_router=IntentRouter(),
+            chat_worker=object(),
+            rag_worker=object(),
+            tool_worker=object(),
+        )
+
+        decision = supervisor.decide("当前的知识库有哪些，你能根据知识库进行回答问题吗？")
+
+        self.assertEqual(decision.worker, AgentWorkerType.TOOL)
+        self.assertIn("kb_catalog", decision.signals)
+
+    def test_tool_agent_worker_injects_registered_tool_inventory(self):
+        def list_knowledge_base_collections() -> str:
+            return "medical_kb, tech_docs_kb"
+
+        llm = FakeAgentLLM(
+            [
+                SimpleNamespace(
+                    content="I can inspect the connected knowledge bases.",
+                    tool_calls=[],
+                    reasoning_content=None,
+                )
+            ]
+        )
+        worker = ToolAgentWorker(
+            agent_engine=AgentEngine(
+                llm=llm,
+                tool_registry=ToolRegistry.from_callables([list_knowledge_base_collections]),
+                run_config=AgentRunConfig(max_iterations=2),
+            ),
+            context_engine=ContextEngine(),
+        )
+
+        list(worker.stream("你能调用哪些工具？", history=[]))
+
+        self.assertTrue(llm.calls)
+        system_messages = [
+            message["content"]
+            for message in llm.calls[0]
+            if message.get("role") == "system"
+        ]
+        self.assertTrue(any("Registered tools are listed below" in item for item in system_messages))
+        self.assertTrue(any("list_knowledge_base_collections" in item for item in system_messages))
+
+    def test_kb_catalog_tool_lists_connected_collections(self):
+        tool = KnowledgeBaseCatalogTool(FakeKBApp())
+
+        result = tool.list_knowledge_base_collections()
+
+        self.assertIn("medical_kb", result)
+        self.assertIn("tech_docs_kb", result)
+        self.assertIn("across all connected collections", result)
 
 
 if __name__ == "__main__":
