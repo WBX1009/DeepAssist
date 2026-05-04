@@ -12,3 +12,43 @@ class KnowledgeBaseFile(BaseModel):
 
     def to_dict(self) -> Dict[str, Any]:
         return self.model_dump()
+
+
+class KnowledgeBaseCollectionHealth(BaseModel):
+    """Collection-level vector index health summary."""
+
+    collection_name: str = Field(..., description="Knowledge-base collection name")
+    expected_segment_id: str | None = Field(
+        default=None,
+        description="Segment directory id recorded in Chroma manifest",
+    )
+    actual_segment_dir_present: bool = Field(
+        default=False,
+        description="Whether the expected Chroma segment directory exists on disk",
+    )
+    count: int | None = Field(
+        default=None,
+        ge=0,
+        description="Document/chunk count reported by Chroma",
+    )
+    get_ok: bool = Field(default=False, description="Whether collection.get() succeeded")
+    query_ok: bool = Field(default=False, description="Whether collection.query() succeeded")
+    whoosh_docs: int | None = Field(
+        default=None,
+        ge=0,
+        description="Stored document/chunk count exported from Whoosh",
+    )
+    healthy: bool = Field(default=False, description="Overall collection health verdict")
+    errors: list[str] = Field(default_factory=list, description="Diagnostic failures or mismatches")
+    repaired: bool = Field(default=False, description="Whether repair was attempted in this run")
+
+
+class KnowledgeBaseHealthReport(BaseModel):
+    """Repository-wide knowledge-base health report."""
+
+    vector_db_path: str = Field(..., description="Chroma persistence root")
+    keyword_db_path: str = Field(..., description="Whoosh persistence root")
+    checked_at: str = Field(..., description="ISO timestamp of the health check")
+    collections: list[KnowledgeBaseCollectionHealth] = Field(default_factory=list)
+    orphan_segment_dirs: list[str] = Field(default_factory=list)
+    quarantined_dirs: list[str] = Field(default_factory=list)

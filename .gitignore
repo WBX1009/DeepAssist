@@ -66,8 +66,6 @@ code_dump.txt
 tree_output.txt
 test.py
 *.ipynb
-tests/
-vector_index_doctor.py
 
 
 # =========================

@@ -13,6 +13,7 @@ from backend.domain.interfaces.memory_db import BaseMemoryStore
 from backend.domain.interfaces.vector_db import BaseVectorDB
 from backend.infrastructure.databases.chroma_store import ChromaStore
 from backend.infrastructure.databases.sqlite_memory import SQLiteMemoryStore
+from backend.infrastructure.databases.vector_index_health import VectorIndexHealthInspector
 from backend.infrastructure.databases.whoosh_store import WhooshStore
 from backend.infrastructure.embeddings.bge_m3_local import BGEM3Local
 from backend.infrastructure.llms.deepseek_client import DeepSeekClient
@@ -41,6 +42,7 @@ from backend.services.rag.query_planner import QueryPlanner
 from backend.services.rag.query_rewriter import QueryRewriteService
 from backend.services.rag.reranker import LexicalOverlapReranker
 from backend.services.session.manager import SessionManager
+from backend.common.config import settings
 
 logger = get_logger(__name__)
 
@@ -85,6 +87,16 @@ def get_keyword_db() -> Optional[BaseKeywordDB]:
 @lru_cache()
 def get_memory_store() -> BaseMemoryStore:
     return SQLiteMemoryStore()
+
+
+@lru_cache()
+def get_vector_index_health_inspector() -> VectorIndexHealthInspector:
+    return VectorIndexHealthInspector(
+        vector_db_path=settings.VECTOR_DB_PATH,
+        keyword_db_path=settings.KEYWORD_DB_PATH,
+        report_path=settings.VECTOR_HEALTH_REPORT_PATH,
+        embedding_model=get_embedding_model(),
+    )
 
 
 # -----------------------------------------------------------------------------
@@ -291,4 +303,5 @@ def get_kb_app() -> KnowledgeBaseApp:
         embedding_model=get_embedding_model(),
         vector_db=get_vector_db(),
         keyword_db=get_keyword_db(),
+        health_inspector=get_vector_index_health_inspector(),
     )
