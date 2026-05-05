@@ -4,6 +4,7 @@ from typing import Any, Callable, List, Optional
 from backend.application.agent_app import AgentApplication
 from backend.application.chat_app import ChatApplication
 from backend.application.kb_app import KnowledgeBaseApp
+from backend.application.runtime_app import RuntimeApplication
 from backend.common.event_bus import event_bus
 from backend.common.logger import get_logger
 from backend.domain.interfaces.embedding import BaseEmbedding
@@ -358,4 +359,12 @@ def get_kb_app() -> KnowledgeBaseApp:
         vector_db=get_vector_db(),
         keyword_db=get_keyword_db(),
         health_inspector=get_vector_index_health_inspector(),
+    )
+
+
+@lru_cache()
+def get_runtime_app() -> RuntimeApplication:
+    return RuntimeApplication(
+        kb_app=get_kb_app(),
+        tool_registry=get_tool_registry(),
     )

@@ -10,7 +10,7 @@ if __package__ in (None, ""):
     if project_root not in sys.path:
         sys.path.append(project_root)
 
-from backend.api.routers import agent_api, chat_api, kb_api
+from backend.api.routers import agent_api, chat_api, kb_api, runtime_api
 from backend.common.logger import get_logger
 
 logger = get_logger(__name__)
@@ -35,6 +35,7 @@ def create_app() -> FastAPI:
     app.include_router(chat_api.router)
     app.include_router(agent_api.router)
     app.include_router(kb_api.router)
+    app.include_router(runtime_api.router)
 
     @app.get("/health", tags=["System"])
     def health_check() -> dict:

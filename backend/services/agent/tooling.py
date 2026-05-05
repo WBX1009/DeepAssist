@@ -111,6 +111,29 @@ class ToolRegistry:
 
         return "\n".join(lines)
 
+    def list_tool_specs(self) -> List[Dict[str, Any]]:
+        specs: List[Dict[str, Any]] = []
+        for spec in sorted(self._tools.values(), key=lambda item: item.name):
+            properties = spec.parameters.get("properties", {})
+            required_args = list(spec.parameters.get("required", []))
+            specs.append(
+                {
+                    "name": spec.name,
+                    "description": spec.description,
+                    "required_args": required_args,
+                    "parameters": [
+                        {
+                            "name": name,
+                            "type": schema.get("type", "string"),
+                            "required": name in required_args,
+                            "description": schema.get("description", ""),
+                        }
+                        for name, schema in properties.items()
+                    ],
+                }
+            )
+        return specs
+
     def execute(self, tool_call: ToolCall) -> ToolResult:
         spec = self._tools.get(tool_call.name)
         if not spec:

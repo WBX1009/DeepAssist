@@ -6,6 +6,7 @@ from typing import Any
 from backend.application.agent_app import AgentApplication
 from backend.application.chat_app import ChatApplication
 from backend.application.kb_app import KnowledgeBaseApp
+from backend.application.runtime_app import RuntimeApplication
 from backend.domain.entities.context_window import ContextSummary
 from backend.domain.entities.agent_run import AgentRunConfig
 from backend.domain.entities.agent_plan import MultiAgentPlan
@@ -834,6 +835,26 @@ class BackendRegressionTests(unittest.TestCase):
         self.assertIn("medical_kb", result)
         self.assertIn("tech_docs_kb", result)
         self.assertIn("across all connected collections", result)
+
+    def test_runtime_capabilities_expose_real_models_tools_and_kb_scopes(self):
+        def read_local_file(file: str) -> str:
+            return file
+
+        app = RuntimeApplication(
+            kb_app=FakeKBApp(),
+            tool_registry=ToolRegistry.from_callables([read_local_file]),
+        )
+
+        payload = app.get_capabilities()
+        data = payload.get("data", {})
+        tools = data.get("tools", [])
+        scopes = data.get("knowledge_base", {}).get("rag_scope_options", [])
+
+        self.assertEqual(payload.get("status"), "success")
+        self.assertTrue(any(item.get("id") == "deepseek-chat" for item in data.get("models", [])))
+        self.assertTrue(any(item.get("name") == "read_local_file" for item in tools))
+        self.assertTrue(any(item.get("id") == "__all__" for item in scopes))
+        self.assertTrue(any(item.get("id") == "medical_kb" for item in scopes))
 
     def test_query_planner_emits_rewrite_metadata_for_short_technical_query(self):
         planner = QueryPlanner()
