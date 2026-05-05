@@ -22,6 +22,7 @@ class BaseAgentWorker:
         history: List[Dict[str, Any]],
         user_profile: Optional[str] = None,
         model_options: Optional[Dict[str, Any]] = None,
+        recovery_state: Optional[Dict[str, Any]] = None,
     ) -> Iterator[Dict[str, Any]]:
         raise NotImplementedError
 
@@ -92,6 +93,7 @@ class RAGWorker(BaseAgentWorker):
         history: List[Dict[str, Any]],
         user_profile: Optional[str] = None,
         model_options: Optional[Dict[str, Any]] = None,
+        recovery_state: Optional[Dict[str, Any]] = None,
     ) -> Iterator[Dict[str, Any]]:
         yield {"type": "status", "content": "Supervisor selected RAGWorker"}
         pipeline_result = self.rag_pipeline.build_context(query, self.collection_name)
@@ -278,34 +280,42 @@ class ToolAgentWorker(BaseAgentWorker):
         history: List[Dict[str, Any]],
         user_profile: Optional[str] = None,
         model_options: Optional[Dict[str, Any]] = None,
+        recovery_state: Optional[Dict[str, Any]] = None,
     ) -> Iterator[Dict[str, Any]]:
         yield {"type": "status", "content": "Supervisor selected ToolAgentWorker"}
-        context = self.context_engine.build_agent_context(
-            query=query,
-            history=history,
-            use_user_memory=bool(user_profile),
-            user_profile=user_profile,
-        )
-        messages = list(context.messages)
-        tool_inventory = self.agent_engine.tool_registry.describe_tools()
-        inventory_message = {
-            "role": "system",
-            "content": (
-                "Registered tools are listed below. Do not invent tools that are not in this list.\n"
-                "For questions about which knowledge bases are connected, use "
-                "`list_knowledge_base_collections` or `list_knowledge_base_files`.\n"
-                "For questions that need evidence from indexed content, use "
-                "`search_knowledge_base`.\n\n"
-                f"{tool_inventory}"
-            ),
-        }
-        if messages and messages[0].get("role") == "system":
-            messages.insert(1, inventory_message)
+        if recovery_state:
+            yield {"type": "status", "content": "Resuming interrupted tool-agent task."}
+            messages = list(recovery_state.get("messages", []))
+            resume_state = recovery_state.get("lifecycle_state", {})
         else:
-            messages.insert(0, inventory_message)
+            context = self.context_engine.build_agent_context(
+                query=query,
+                history=history,
+                use_user_memory=bool(user_profile),
+                user_profile=user_profile,
+            )
+            messages = list(context.messages)
+            tool_inventory = self.agent_engine.tool_registry.describe_tools()
+            inventory_message = {
+                "role": "system",
+                "content": (
+                    "Registered tools are listed below. Do not invent tools that are not in this list.\n"
+                    "For questions about which knowledge bases are connected, use "
+                    "`list_knowledge_base_collections` or `list_knowledge_base_files`.\n"
+                    "For questions that need evidence from indexed content, use "
+                    "`search_knowledge_base`.\n\n"
+                    f"{tool_inventory}"
+                ),
+            }
+            if messages and messages[0].get("role") == "system":
+                messages.insert(1, inventory_message)
+            else:
+                messages.insert(0, inventory_message)
+            resume_state = None
         yield from self.agent_engine.stream_run(
             messages,
             model_options=model_options,
+            resume_state=resume_state,
         )
 
 
@@ -332,16 +342,36 @@ class OrchestratorWorker(BaseAgentWorker):
         history: List[Dict[str, Any]],
         user_profile: Optional[str] = None,
         model_options: Optional[Dict[str, Any]] = None,
+        recovery_state: Optional[Dict[str, Any]] = None,
     ) -> Iterator[Dict[str, Any]]:
         yield {"type": "status", "content": "Supervisor selected OrchestratorWorker"}
-        plan = self.task_decomposer.preview(
-            query,
-            rag_available=self.rag_worker is not None,
-        )
+        if recovery_state:
+            yield {"type": "status", "content": "Resuming interrupted orchestration task."}
+            plan = MultiAgentPlan.model_validate(recovery_state.get("plan", {}))
+            collaborator_results: List[Dict[str, Any]] = list(
+                recovery_state.get("collaborator_results", [])
+            )
+            start_index = int(recovery_state.get("next_task_index", 0))
+        else:
+            plan = self.task_decomposer.preview(
+                query,
+                rag_available=self.rag_worker is not None,
+            )
+            collaborator_results = []
+            start_index = 0
         yield {"type": "multi_agent_plan", "data": plan.to_trace_data()}
+        yield {
+            "type": "task_snapshot",
+            "data": {
+                "route_worker": self.worker_type.value,
+                "status": "running",
+                "plan": plan.model_dump(exclude_none=True),
+                "collaborator_results": collaborator_results,
+                "next_task_index": start_index,
+            },
+        }
 
-        collaborator_results: List[Dict[str, Any]] = []
-        for task in plan.tasks:
+        for index, task in enumerate(plan.tasks[start_index:], start=start_index):
             worker = self._worker_for(task.worker)
             task_query = self._build_task_query(query, task.query, collaborator_results)
             yield {
@@ -360,6 +390,7 @@ class OrchestratorWorker(BaseAgentWorker):
                 history=history,
                 user_profile=user_profile,
                 model_options=model_options,
+                recovery_state=None,
             ):
                 event_type = event.get("type")
                 if event_type == "message_delta":
@@ -393,7 +424,27 @@ class OrchestratorWorker(BaseAgentWorker):
                     "output_preview": (answer_text or "")[:240],
                 },
             }
+            yield {
+                "type": "task_snapshot",
+                "data": {
+                    "route_worker": self.worker_type.value,
+                    "status": "running",
+                    "plan": plan.model_dump(exclude_none=True),
+                    "collaborator_results": collaborator_results,
+                    "next_task_index": index + 1,
+                },
+            }
 
+        yield {
+            "type": "task_snapshot",
+            "data": {
+                "route_worker": self.worker_type.value,
+                "status": "running",
+                "plan": plan.model_dump(exclude_none=True),
+                "collaborator_results": collaborator_results,
+                "next_task_index": len(plan.tasks),
+            },
+        }
         synthesis_messages = self._build_synthesis_messages(
             query=query,
             collaborator_results=collaborator_results,

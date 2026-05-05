@@ -4,6 +4,7 @@ from backend.common.event_bus import event_bus
 from backend.common.logger import get_logger
 from backend.domain.entities.context_window import ContextWindowPlan
 from backend.domain.entities.message import AIMessage, Message
+from backend.domain.entities.task_snapshot import TaskSnapshot
 from backend.domain.entities.tooling import ToolCall
 from backend.domain.interfaces.memory_db import BaseMemoryStore
 from backend.services.session.context_window_manager import PriorityContextWindowManager
@@ -134,6 +135,15 @@ class SessionManager:
 
     def list_sessions(self) -> List[Dict[str, Any]]:
         return self.store.get_all_sessions()
+
+    def get_task_snapshot(self, session_id: str) -> TaskSnapshot | None:
+        return self.store.get_task_snapshot(session_id)
+
+    def save_task_snapshot(self, snapshot: TaskSnapshot) -> bool:
+        return self.store.save_task_snapshot(snapshot)
+
+    def clear_task_snapshot(self, session_id: str) -> bool:
+        return self.store.clear_task_snapshot(session_id)
 
     def _load_and_normalize_history(self, session_id: str, limit: int) -> List[Dict[str, Any]]:
         history_entities = self.store.get_history(session_id, limit=limit)

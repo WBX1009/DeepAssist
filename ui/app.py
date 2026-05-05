@@ -695,6 +695,13 @@ def render_event_trace_v2(events: List[Dict[str, Any]]) -> None:
                 )
                 if data.get("output_preview"):
                     st.caption(data.get("output_preview"))
+            elif event_name == "task_recovery":
+                st.markdown(
+                    f"- Task recovery: worker=`{data.get('route_worker', 'unknown')}` "
+                    f"status=`{data.get('status', 'running')}`"
+                )
+                if data.get("payload_keys"):
+                    st.caption(f"Recovered snapshot keys: {data.get('payload_keys')}")
             elif event_name == "retrieval_trace":
                 st.markdown(
                     f"- Retrieval: hits=`{data.get('hit_count', 0)}` "
@@ -778,6 +785,8 @@ def compact_event_summary_v2(events: List[Dict[str, Any]]) -> str:
             parts.append(f"plan2:{data.get('task_count', 0)}")
         elif name == "collaborator_trace":
             parts.append(f"collab:{data.get('worker', 'unknown')}")
+        elif name == "task_recovery":
+            parts.append(f"resume:{data.get('route_worker', 'unknown')}")
         elif name == "retrieval_trace":
             parts.append(f"retrieval:{data.get('hit_count', 0)}")
         elif name == "citation_trace":
@@ -852,6 +861,7 @@ def stream_backend_answer(prompt: str) -> Dict[str, Any]:
                     "context_window_trace",
                     "multi_agent_plan",
                     "collaborator_trace",
+                    "task_recovery",
                     "retrieval_trace",
                     "citation_trace",
                     "tool_call",

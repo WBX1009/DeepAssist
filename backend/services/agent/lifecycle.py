@@ -13,9 +13,9 @@ from backend.domain.entities.tooling import ToolCall, ToolResult
 class AgentLifecycle:
     """Guards a single ReAct run against runaway loops and broken tool states."""
 
-    def __init__(self, config: AgentRunConfig):
+    def __init__(self, config: AgentRunConfig, state: Optional[AgentRunState] = None):
         self.config = config
-        self.state = AgentRunState()
+        self.state = state or AgentRunState()
 
     @property
     def remaining_steps(self) -> int:

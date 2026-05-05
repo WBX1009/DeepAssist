@@ -13,6 +13,7 @@ from backend.domain.entities.document import DocumentChunk
 from backend.domain.entities.knowledge_base import KnowledgeBaseHealthReport
 from backend.domain.entities.rag_pipeline import RAGPipelineResult
 from backend.domain.entities.retrieval import Citation, RAGContextPack, RerankTrace, RetrievalResult
+from backend.domain.entities.task_snapshot import TaskSnapshot
 from backend.domain.entities.tooling import ToolCall
 from backend.domain.interfaces.memory_db import BaseMemoryStore
 from backend.infrastructure.tools.kb_catalog_tool import KnowledgeBaseCatalogTool
@@ -34,6 +35,7 @@ class FakeMemoryStore(BaseMemoryStore):
     def __init__(self):
         self.messages: dict[str, list[Any]] = {}
         self.profiles: dict[str, str] = {}
+        self.task_snapshots: dict[str, TaskSnapshot] = {}
 
     def get_history(self, session_id: str, limit: int = 10):
         return list(self.messages.get(session_id, []))[-limit:]
@@ -58,6 +60,17 @@ class FakeMemoryStore(BaseMemoryStore):
 
     def get_all_profiles(self):
         return dict(self.profiles)
+
+    def get_task_snapshot(self, session_id: str):
+        return self.task_snapshots.get(session_id)
+
+    def save_task_snapshot(self, snapshot: TaskSnapshot) -> bool:
+        self.task_snapshots[snapshot.session_id] = snapshot
+        return True
+
+    def clear_task_snapshot(self, session_id: str) -> bool:
+        self.task_snapshots.pop(session_id, None)
+        return True
 
 
 class FakeLLM:
@@ -267,13 +280,14 @@ class FakeCollaboratorWorker:
         self.extra_events = extra_events or []
         self.calls: list[dict[str, Any]] = []
 
-    def stream(self, query: str, history, user_profile=None, model_options=None):
+    def stream(self, query: str, history, user_profile=None, model_options=None, recovery_state=None):
         self.calls.append(
             {
                 "query": query,
                 "history": history,
                 "user_profile": user_profile,
                 "model_options": model_options,
+                "recovery_state": recovery_state,
             }
         )
         for event in self.extra_events:
@@ -294,6 +308,43 @@ class FakeSynthesisLLM:
         self.calls.append(messages)
         for chunk in self.chunks:
             yield chunk
+
+
+class FakeRecoverySupervisor:
+    def __init__(self):
+        self.resume_calls: list[dict[str, Any]] = []
+
+    def stream(self, query: str, history, user_profile=None, model_options=None):
+        yield {"type": "message_delta", "content": "fresh-run"}
+        yield {
+            "type": "finish",
+            "new_messages": [{"role": "assistant", "content": "fresh-run"}],
+            "worker": "tool_agent_worker",
+        }
+
+    def stream_recovery(
+        self,
+        worker_kind: str,
+        query: str,
+        history,
+        user_profile=None,
+        model_options=None,
+        recovery_state=None,
+    ):
+        self.resume_calls.append(
+            {
+                "worker_kind": worker_kind,
+                "query": query,
+                "history": history,
+                "recovery_state": recovery_state,
+            }
+        )
+        yield {"type": "message_delta", "content": "resumed-run"}
+        yield {
+            "type": "finish",
+            "new_messages": [{"role": "assistant", "content": "resumed-run"}],
+            "worker": worker_kind,
+        }
 
 
 class BackendRegressionTests(unittest.TestCase):
@@ -1009,6 +1060,105 @@ class BackendRegressionTests(unittest.TestCase):
         synthesis_prompt = llm.calls[0][1]["content"]
         self.assertIn("RAG evidence", synthesis_prompt)
         self.assertIn("Tool result", synthesis_prompt)
+
+    def test_agent_application_resumes_interrupted_task_from_snapshot(self):
+        store = FakeMemoryStore()
+        store.save_task_snapshot(
+            TaskSnapshot(
+                session_id="session-recover",
+                query="compute stats",
+                route_worker="tool_agent_worker",
+                status="interrupted",
+                payload={
+                    "messages": [
+                        {"role": "system", "content": "agent"},
+                        {"role": "user", "content": "compute stats"},
+                    ],
+                    "lifecycle_state": {"iterations": 1},
+                },
+            )
+        )
+        supervisor = FakeRecoverySupervisor()
+        app = AgentApplication(
+            agent_engine=None,
+            session_manager=SessionManager(store),
+            context_engine=ContextEngine(),
+            profile_extractor=FakeProfileExtractor(),
+            supervisor=supervisor,
+        )
+
+        events = list(app.stream_agent_task("session-recover", "继续"))
+        payloads = [
+            json.loads(chunk[6:].strip())
+            for chunk in events
+            if chunk.startswith("data: ") and chunk[6:].strip()
+        ]
+
+        recovery_events = [payload for payload in payloads if payload.get("event") == "task_recovery"]
+        self.assertTrue(recovery_events)
+        self.assertEqual(supervisor.resume_calls[0]["worker_kind"], "tool_agent_worker")
+        self.assertEqual(supervisor.resume_calls[0]["query"], "compute stats")
+        self.assertIsNone(store.get_task_snapshot("session-recover"))
+
+    def test_orchestrator_worker_resumes_from_saved_progress(self):
+        rag_worker = FakeCollaboratorWorker("RAG evidence: API Key is created in console.")
+        tool_worker = FakeCollaboratorWorker("Tool result: computed delta is 4.4.")
+        chat_worker = FakeCollaboratorWorker("Chat framing: answer concisely.")
+        llm = FakeSynthesisLLM(["Recovered final answer"])
+        worker = OrchestratorWorker(
+            llm=llm,
+            chat_worker=chat_worker,
+            rag_worker=rag_worker,
+            tool_worker=tool_worker,
+            task_decomposer=TaskDecomposer(),
+        )
+        recovery_state = {
+            "plan": MultiAgentPlan(
+                tasks=[
+                    {
+                        "task_id": "task-rag-1",
+                        "title": "Collect grounded knowledge-base evidence",
+                        "worker": AgentWorkerType.RAG,
+                        "query": "query",
+                        "rationale": "rag",
+                    },
+                    {
+                        "task_id": "task-tool-1",
+                        "title": "Execute tools and gather operational results",
+                        "worker": AgentWorkerType.TOOL,
+                        "query": "query",
+                        "rationale": "tool",
+                    },
+                ]
+            ).model_dump(),
+            "collaborator_results": [
+                {
+                    "task_id": "task-rag-1",
+                    "title": "Collect grounded knowledge-base evidence",
+                    "worker": AgentWorkerType.RAG.value,
+                    "answer": "Recovered RAG evidence",
+                }
+            ],
+            "next_task_index": 1,
+        }
+
+        events = list(
+            worker.stream(
+                query="complex task",
+                history=[],
+                recovery_state=recovery_state,
+            )
+        )
+
+        self.assertEqual(len(rag_worker.calls), 0)
+        self.assertEqual(len(tool_worker.calls), 1)
+        self.assertTrue(any(event.get("type") == "task_snapshot" for event in events))
+        final_chunks = [
+            event.get("content", "")
+            for event in events
+            if event.get("type") == "message_delta"
+        ]
+        self.assertEqual("".join(final_chunks), "Recovered final answer")
 
 
 if __name__ == "__main__":

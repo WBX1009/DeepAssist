@@ -3,7 +3,11 @@ from typing import Any, Callable, Dict, Iterator, List, Optional
 
 from backend.common.config import settings
 from backend.common.logger import get_logger
-from backend.domain.entities.agent_run import AgentRunConfig, AgentTerminationReason
+from backend.domain.entities.agent_run import (
+    AgentRunConfig,
+    AgentRunState,
+    AgentTerminationReason,
+)
 from backend.domain.entities.tooling import ToolCall, ToolResult
 from backend.domain.interfaces.llm import BaseLLM
 from backend.services.agent.lifecycle import AgentLifecycle
@@ -35,9 +39,18 @@ class AgentEngine:
         self,
         messages: List[Dict[str, Any]],
         model_options: Optional[Dict[str, Any]] = None,
+        resume_state: Optional[Dict[str, Any]] = None,
     ) -> Iterator[Dict[str, Any]]:
         current_messages = messages.copy()
-        lifecycle = AgentLifecycle(self.run_config)
+        restored_state = (
+            AgentRunState.model_validate(resume_state or {})
+            if resume_state
+            else None
+        )
+        lifecycle = AgentLifecycle(
+            self.run_config,
+            state=restored_state,
+        )
         model_kwargs = {
             key: value for key, value in (model_options or {}).items() if value is not None
         }
@@ -51,6 +64,7 @@ class AgentEngine:
                 ),
                 "state": lifecycle.state.terminal_payload(),
             }
+            yield self._task_snapshot_event(current_messages, lifecycle)
 
             try:
                 response_msg = self.llm.chat(
@@ -90,6 +104,7 @@ class AgentEngine:
                     "content": safe_content,
                     "state": lifecycle.state.terminal_payload(),
                 }
+                yield self._task_snapshot_event(current_messages, lifecycle, status="completed")
                 yield self._finish_event(messages, current_messages, lifecycle)
                 return
 
@@ -107,6 +122,7 @@ class AgentEngine:
                     current_messages.append(result.to_tool_message())
 
                 yield self._terminal_error_event(lifecycle)
+                yield self._task_snapshot_event(current_messages, lifecycle, status="failed")
                 yield self._finish_event(messages, current_messages, lifecycle)
                 return
 
@@ -127,8 +143,10 @@ class AgentEngine:
                 if duplicate_plan_result is not None:
                     yield self._tool_result_event(duplicate_plan_result)
                     current_messages.append(duplicate_plan_result.to_tool_message())
+                    yield self._task_snapshot_event(current_messages, lifecycle)
                     if lifecycle.record_tool_result(duplicate_plan_result):
                         yield self._terminal_error_event(lifecycle)
+                        yield self._task_snapshot_event(current_messages, lifecycle, status="failed")
                         yield self._finish_event(messages, current_messages, lifecycle)
                         return
                     recovery_decision = self._build_recovery_decision(
@@ -157,14 +175,17 @@ class AgentEngine:
                 tool_result = self._execute_tool_call(tool_call, lifecycle)
                 yield self._tool_result_event(tool_result)
                 current_messages.append(tool_result.to_tool_message())
+                yield self._task_snapshot_event(current_messages, lifecycle)
 
                 if lifecycle.state.is_terminal:
                     yield self._terminal_error_event(lifecycle)
+                    yield self._task_snapshot_event(current_messages, lifecycle, status="failed")
                     yield self._finish_event(messages, current_messages, lifecycle)
                     return
 
                 if lifecycle.record_tool_result(tool_result):
                     yield self._terminal_error_event(lifecycle)
+                    yield self._task_snapshot_event(current_messages, lifecycle, status="failed")
                     yield self._finish_event(messages, current_messages, lifecycle)
                     return
 
@@ -189,6 +210,7 @@ class AgentEngine:
                     )
 
         yield self._terminal_error_event(lifecycle)
+        yield self._task_snapshot_event(current_messages, lifecycle, status="failed")
         yield self._finish_event(messages, current_messages, lifecycle)
 
     def _execute_tool_call(
@@ -532,4 +554,20 @@ class AgentEngine:
             if lifecycle.state.termination_reason
             else None,
             "state": lifecycle.state.terminal_payload(),
+        }
+
+    def _task_snapshot_event(
+        self,
+        current_messages: List[Dict[str, Any]],
+        lifecycle: AgentLifecycle,
+        status: str = "running",
+    ) -> Dict[str, Any]:
+        return {
+            "type": "task_snapshot",
+            "data": {
+                "route_worker": "tool_agent_worker",
+                "status": status,
+                "messages": current_messages,
+                "lifecycle_state": lifecycle.state.model_dump(exclude_none=True),
+            },
         }

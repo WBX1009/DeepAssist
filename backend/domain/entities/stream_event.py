@@ -94,6 +94,10 @@ class StreamEvent(BaseModel):
         return cls(event="failure_recovery", message=message, data=data)
 
     @classmethod
+    def task_recovery(cls, data: Dict[str, Any]) -> "StreamEvent":
+        return cls(event="task_recovery", data=data)
+
+    @classmethod
     def self_correction(cls, message: str, data: Dict[str, Any]) -> "StreamEvent":
         return cls(event="self_correction", message=message, data=data)
 

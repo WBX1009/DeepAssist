@@ -123,6 +123,33 @@ class AgentSupervisor:
             model_options=model_options,
         )
 
+    def stream_recovery(
+        self,
+        worker_kind: str,
+        query: str,
+        history: List[Dict[str, Any]],
+        user_profile: Optional[str] = None,
+        model_options: Optional[Dict[str, Any]] = None,
+        recovery_state: Optional[Dict[str, Any]] = None,
+    ) -> Iterator[Dict[str, Any]]:
+        worker = self._worker_for_kind(worker_kind)
+        yield {
+            "type": "supervisor_route",
+            "worker": worker.worker_type.value,
+            "worker_kind": self._worker_kind(worker.worker_type),
+            "intent": IntentType.AGENT.value,
+            "confidence": 0.99,
+            "reason": f"resuming previously interrupted task on {worker_kind}",
+            "signals": ["task_recovery"],
+        }
+        yield from worker.stream(
+            query=query,
+            history=history,
+            user_profile=user_profile,
+            model_options=model_options,
+            recovery_state=recovery_state,
+        )
+
     def _worker_for(self, worker_type: AgentWorkerType) -> BaseAgentWorker:
         if (
             worker_type == AgentWorkerType.ORCHESTRATOR
@@ -134,6 +161,13 @@ class AgentSupervisor:
         if worker_type == AgentWorkerType.TOOL:
             return self.tool_worker
         return self.chat_worker
+
+    def _worker_for_kind(self, worker_kind: str) -> BaseAgentWorker:
+        normalized = (worker_kind or "").strip()
+        for worker_type in AgentWorkerType:
+            if worker_type.value == normalized:
+                return self._worker_for(worker_type)
+        return self.tool_worker
 
     def _worker_kind(self, worker_type: AgentWorkerType) -> str:
         if worker_type == AgentWorkerType.ORCHESTRATOR:

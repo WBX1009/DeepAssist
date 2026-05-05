@@ -5,6 +5,7 @@ from typing import List, Dict, Any, Optional
 
 from backend.domain.interfaces.memory_db import BaseMemoryStore
 from backend.domain.entities.message import Message, AIMessage
+from backend.domain.entities.task_snapshot import TaskSnapshot
 from backend.common.config import settings
 from backend.common.logger import get_logger
 
@@ -48,6 +49,16 @@ class SQLiteMemoryStore(BaseMemoryStore):
                     CREATE TABLE IF NOT EXISTS user_profiles (
                         key TEXT PRIMARY KEY,
                         value TEXT,
+                        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                    )
+                """)
+                cursor.execute("""
+                    CREATE TABLE IF NOT EXISTS task_snapshots (
+                        session_id TEXT PRIMARY KEY,
+                        query TEXT NOT NULL,
+                        route_worker TEXT NOT NULL,
+                        status TEXT NOT NULL,
+                        payload TEXT,
                         updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                     )
                 """)
@@ -218,3 +229,72 @@ class SQLiteMemoryStore(BaseMemoryStore):
         except Exception as e:
             logger.error(f"Failed to read user profiles: {e}")
             return {}
+
+    def get_task_snapshot(self, session_id: str) -> Optional[TaskSnapshot]:
+        try:
+            with self._get_connection() as conn:
+                cursor = conn.cursor()
+                cursor.execute(
+                    """
+                    SELECT session_id, query, route_worker, status, payload, updated_at
+                    FROM task_snapshots
+                    WHERE session_id = ?
+                    """,
+                    (session_id,),
+                )
+                row = cursor.fetchone()
+                if not row:
+                    return None
+                payload = json.loads(row[4]) if row[4] else {}
+                return TaskSnapshot(
+                    session_id=row[0],
+                    query=row[1],
+                    route_worker=row[2],
+                    status=row[3],
+                    payload=payload if isinstance(payload, dict) else {},
+                    updated_at=row[5],
+                )
+        except Exception as e:
+            logger.error(f"Failed to read task snapshot [{session_id}]: {e}")
+            return None
+
+    def save_task_snapshot(self, snapshot: TaskSnapshot) -> bool:
+        try:
+            payload_json = json.dumps(snapshot.payload, ensure_ascii=False)
+            with self._get_connection() as conn:
+                cursor = conn.cursor()
+                cursor.execute(
+                    """
+                    INSERT INTO task_snapshots (session_id, query, route_worker, status, payload, updated_at)
+                    VALUES (?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+                    ON CONFLICT(session_id) DO UPDATE SET
+                        query = excluded.query,
+                        route_worker = excluded.route_worker,
+                        status = excluded.status,
+                        payload = excluded.payload,
+                        updated_at = CURRENT_TIMESTAMP
+                    """,
+                    (
+                        snapshot.session_id,
+                        snapshot.query,
+                        snapshot.route_worker,
+                        snapshot.status,
+                        payload_json,
+                    ),
+                )
+                conn.commit()
+            return True
+        except Exception as e:
+            logger.error(f"Failed to save task snapshot [{snapshot.session_id}]: {e}")
+            return False
+
+    def clear_task_snapshot(self, session_id: str) -> bool:
+        try:
+            with self._get_connection() as conn:
+                cursor = conn.cursor()
+                cursor.execute("DELETE FROM task_snapshots WHERE session_id = ?", (session_id,))
+                conn.commit()
+            return True
+        except Exception as e:
+            logger.error(f"Failed to clear task snapshot [{session_id}]: {e}")
+            return False
