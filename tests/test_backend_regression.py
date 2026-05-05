@@ -22,6 +22,9 @@ from backend.services.agent.supervisor import AgentSupervisor
 from backend.services.agent.tooling import ToolRegistry
 from backend.services.agent.workers import ToolAgentWorker
 from backend.services.context_engine import ContextEngine
+from backend.services.rag.answer_guard import SourceAwareResponseGuard
+from backend.services.rag.fusion import HybridRetriever
+from backend.services.rag.query_planner import QueryPlanner
 from backend.services.session.manager import SessionManager
 
 
@@ -106,6 +109,19 @@ class FakeRAGPipeline:
             ],
             top_k=5,
             candidate_k=10,
+            metadata={
+                "diagnostics": {
+                    "reason_code": "ok" if self.score >= 0.35 else "low_relevance",
+                    "reason_message": "retrieval_ready"
+                    if self.score >= 0.35
+                    else "top_document_score_below_threshold",
+                    "suggested_action": "proceed_with_rag"
+                    if self.score >= 0.35
+                    else "fallback_to_chat",
+                    "best_score": self.score,
+                    "low_relevance_threshold": 0.35,
+                }
+            },
             rerank=RerankTrace(
                 enabled=True,
                 success=True,
@@ -138,8 +154,17 @@ class FakeRAGPipeline:
 
     def check_answer(self, answer: str, pipeline_result: RAGPipelineResult):
         class Report:
+            grounded = True
+            recommended_action = "accept"
+            reason = "answer_grounded"
+
             def to_stream_data(self):
-                return {"grounded": True, "warnings": []}
+                return {
+                    "grounded": True,
+                    "recommended_action": "accept",
+                    "reason": "answer_grounded",
+                    "warnings": [],
+                }
 
         return Report()
 
@@ -199,6 +224,27 @@ class FakeKBApp:
                 },
             ],
         }
+
+
+class FakeEmbeddingModel:
+    def embed_text(self, query: str):
+        return [0.1, 0.2, 0.3]
+
+
+class FakeVectorDB:
+    def __init__(self, docs):
+        self.docs = docs
+
+    def search(self, collection_name, query_vector, top_k):
+        return list(self.docs)[:top_k]
+
+
+class FakeKeywordDB:
+    def __init__(self, docs):
+        self.docs = docs
+
+    def search(self, collection_name, query, top_k):
+        return list(self.docs)[:top_k]
 
     def list_files(self, collection_name: str = "tech_docs_kb"):
         return {
@@ -643,6 +689,95 @@ class BackendRegressionTests(unittest.TestCase):
         self.assertIn("medical_kb", result)
         self.assertIn("tech_docs_kb", result)
         self.assertIn("across all connected collections", result)
+
+    def test_query_planner_emits_rewrite_metadata_for_short_technical_query(self):
+        planner = QueryPlanner()
+
+        plan = planner.plan("请问 DeepSeek API 报错怎么排查？")
+
+        self.assertTrue(plan.metadata.get("rewrite_applied"))
+        self.assertIn("domain_hint_expansion", plan.metadata.get("rewrite_notes", []))
+        self.assertTrue(plan.metadata.get("domain_hints"))
+        self.assertGreaterEqual(len(plan.semantic_queries), 1)
+
+    def test_hybrid_retriever_attaches_failure_attribution_metadata(self):
+        docs = [
+            DocumentChunk(
+                id="chunk-1",
+                content="Unrelated finance report and quarterly summary",
+                metadata={"source_file": "guide.md"},
+                score=0.12,
+            )
+        ]
+        retriever = HybridRetriever(
+            vector_db=FakeVectorDB(docs),
+            keyword_db=FakeKeywordDB([]),
+            embedding_model=FakeEmbeddingModel(),
+        )
+
+        result = retriever.retrieve_with_trace("tech_docs_kb", "DeepSeek 部署报错怎么排查")
+
+        diagnostics = result.metadata.get("diagnostics", {})
+        self.assertEqual(diagnostics.get("reason_code"), "low_relevance")
+        self.assertEqual(diagnostics.get("suggested_action"), "fallback_to_chat")
+        self.assertTrue(diagnostics.get("rewrite_applied"))
+
+    def test_answer_guard_recommends_regeneration_when_citations_are_missing(self):
+        guard = SourceAwareResponseGuard()
+        context_pack = RAGContextPack(
+            query="what is DeepSeek API Key flow",
+            citations=[
+                Citation(
+                    ref_id="C1",
+                    chunk_id="chunk-1",
+                    content="DeepSeek API Key guide",
+                    source_file="kb.md",
+                )
+            ],
+            rendered_context="[C1] DeepSeek API Key guide",
+            budget_chars=1000,
+            used_chars=28,
+        )
+
+        report = guard.check("The API key is issued in the console.", context_pack)
+
+        self.assertFalse(report.grounded)
+        self.assertEqual(report.recommended_action, "regenerate_with_citations")
+        self.assertIn("answer_missing_citations", report.warnings)
+
+    def test_explicit_kb_query_with_low_relevance_returns_safe_kb_miss_answer(self):
+        store = FakeMemoryStore()
+        session_manager = SessionManager(store)
+        llm = FakeLLM(["hallucinated answer"])
+        app = ChatApplication(
+            llm=llm,
+            session_manager=session_manager,
+            context_engine=ContextEngine(),
+            intent_router=IntentRouter(),
+            rag_pipeline=FakeRAGPipeline(score=0.1),
+        )
+
+        events = list(
+            app.stream_chat(
+                "session-rag-kb-miss",
+                "请根据知识库回答 DeepSeek API Key 的获取流程，并给出引用",
+                "rag",
+                collection_name="__all__",
+            )
+        )
+        payloads = [
+            json.loads(chunk[6:].strip())
+            for chunk in events
+            if chunk.startswith("data: ") and chunk[6:].strip()
+        ]
+        answer_text = "".join(
+            payload.get("content", "")
+            for payload in payloads
+            if payload.get("event") == "message_delta"
+        )
+
+        self.assertEqual(len(llm.calls), 0)
+        self.assertIn("根据当前知识库检索", answer_text)
 
 
 if __name__ == "__main__":

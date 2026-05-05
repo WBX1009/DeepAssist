@@ -682,6 +682,14 @@ def render_event_trace_v2(events: List[Dict[str, Any]]) -> None:
                     f"- Retrieval: hits=`{data.get('hit_count', 0)}` "
                     f"candidate_k=`{data.get('candidate_k', 0)}` fusion=`{data.get('fusion', 'n/a')}`"
                 )
+                diagnostics = data.get("metadata", {}).get("diagnostics", {}) if isinstance(data.get("metadata"), dict) else {}
+                if diagnostics:
+                    st.caption(
+                        "Reason: "
+                        f"{diagnostics.get('reason_code', 'ok')} | action={diagnostics.get('suggested_action', 'proceed_with_rag')}"
+                    )
+                    if diagnostics.get("rewrite_notes"):
+                        st.caption(f"Rewrite: {diagnostics.get('rewrite_notes')}")
             elif event_name == "citation_trace":
                 st.markdown(f"- Citations packed: `{len(data.get('citations', []))}`")
             elif event_name == "tool_call":
@@ -697,6 +705,10 @@ def render_event_trace_v2(events: List[Dict[str, Any]]) -> None:
                     f"- Answer guard: grounded=`{data.get('grounded')}` "
                     f"warnings=`{data.get('warnings', [])}`"
                 )
+                if data.get("recommended_action"):
+                    st.caption(
+                        f"Guard action: {data.get('recommended_action')} | reason={data.get('reason', '')}"
+                    )
             elif event_name == "self_correction":
                 st.markdown(f"- Self correction: {event.get('message') or data.get('error')}")
                 if data:

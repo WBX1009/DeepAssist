@@ -76,6 +76,10 @@ class QueryPlanner:
                 "quoted_phrase_count": len(quoted_phrases),
                 "semantic_query_count": len(expansion.semantic_queries),
                 "keyword_query_count": len(expansion.keyword_queries),
+                "rewrite_notes": expansion.rewrite_notes,
+                "stripped_fillers": expansion.stripped_fillers,
+                "domain_hints": expansion.domain_hints,
+                "rewrite_applied": expansion.rewritten_query != normalized_query,
             },
         )
 
