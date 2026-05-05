@@ -677,6 +677,24 @@ def render_event_trace_v2(events: List[Dict[str, Any]]) -> None:
                         f"- Summary injected: dropped_messages=`{summary.get('dropped_message_count', 0)}` "
                         f"dropped_turns=`{summary.get('dropped_turn_count', 0)}`"
                     )
+            elif event_name == "multi_agent_plan":
+                st.markdown(
+                    f"- Multi-agent plan: tasks=`{data.get('task_count', 0)}` "
+                    f"mode=`{data.get('mode', 'sequential_collaboration')}` "
+                    f"complexity=`{data.get('complexity', 'medium')}`"
+                )
+                for task in (data.get("tasks", []) or [])[:4]:
+                    st.caption(
+                        f"{task.get('task_id')} -> {task.get('worker')} | {task.get('title')}"
+                    )
+            elif event_name == "collaborator_trace":
+                st.markdown(
+                    f"- Collaborator: phase=`{data.get('phase', 'unknown')}` "
+                    f"worker=`{data.get('worker', 'unknown')}` "
+                    f"task=`{data.get('task_id', '')}`"
+                )
+                if data.get("output_preview"):
+                    st.caption(data.get("output_preview"))
             elif event_name == "retrieval_trace":
                 st.markdown(
                     f"- Retrieval: hits=`{data.get('hit_count', 0)}` "
@@ -756,6 +774,10 @@ def compact_event_summary_v2(events: List[Dict[str, Any]]) -> str:
             parts.append(
                 f"context:{data.get('selected_turn_count', 0)}/{data.get('budget', 0)}"
             )
+        elif name == "multi_agent_plan":
+            parts.append(f"plan2:{data.get('task_count', 0)}")
+        elif name == "collaborator_trace":
+            parts.append(f"collab:{data.get('worker', 'unknown')}")
         elif name == "retrieval_trace":
             parts.append(f"retrieval:{data.get('hit_count', 0)}")
         elif name == "citation_trace":
@@ -828,6 +850,8 @@ def stream_backend_answer(prompt: str) -> Dict[str, Any]:
                 if event_name in {
                     "supervisor_route",
                     "context_window_trace",
+                    "multi_agent_plan",
+                    "collaborator_trace",
                     "retrieval_trace",
                     "citation_trace",
                     "tool_call",

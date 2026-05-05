@@ -129,6 +129,16 @@ class AgentApplication:
                         StreamEvent.retrieval_trace(event.get("data", {}))
                     )
 
+                elif event_type == "multi_agent_plan":
+                    yield SSEManager.format_event(
+                        StreamEvent.multi_agent_plan(event.get("data", {}))
+                    )
+
+                elif event_type == "collaborator_trace":
+                    yield SSEManager.format_event(
+                        StreamEvent.collaborator_trace(event.get("data", {}))
+                    )
+
                 elif event_type == "citation_trace":
                     yield SSEManager.format_event(
                         StreamEvent.citation_trace(event.get("data", {}))

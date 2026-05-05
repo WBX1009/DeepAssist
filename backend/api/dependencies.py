@@ -31,7 +31,13 @@ from backend.services.agent.engine import AgentEngine
 from backend.services.agent.intent_router import IntentRouter
 from backend.services.agent.supervisor import AgentSupervisor
 from backend.services.agent.tooling import ToolPolicy, ToolRegistry
-from backend.services.agent.workers import ChatWorker, RAGWorker, ToolAgentWorker
+from backend.services.agent.task_decomposer import TaskDecomposer
+from backend.services.agent.workers import (
+    ChatWorker,
+    OrchestratorWorker,
+    RAGWorker,
+    ToolAgentWorker,
+)
 from backend.services.context_engine import ContextEngine
 from backend.services.profile_extractor import ProfileExtractor
 from backend.services.rag.answer_guard import SourceAwareResponseGuard
@@ -208,6 +214,11 @@ def get_intent_router() -> IntentRouter:
 
 
 @lru_cache()
+def get_task_decomposer() -> TaskDecomposer:
+    return TaskDecomposer()
+
+
+@lru_cache()
 def get_profile_extractor() -> ProfileExtractor:
     extractor = ProfileExtractor(memory_store=get_memory_store())
     event_bus.subscribe(
@@ -276,24 +287,35 @@ def get_agent_supervisor() -> AgentSupervisor:
     llm = get_llm()
     context_engine = get_context_engine()
     rag_pipeline = get_rag_pipeline()
+    chat_worker = ChatWorker(llm=llm, context_engine=context_engine)
+    rag_worker = (
+        RAGWorker(
+            llm=llm,
+            context_engine=context_engine,
+            rag_pipeline=rag_pipeline,
+            collection_name="__all__",
+        )
+        if rag_pipeline is not None
+        else None
+    )
+    tool_worker = ToolAgentWorker(
+        agent_engine=get_agent_engine(),
+        context_engine=context_engine,
+    )
 
     return AgentSupervisor(
         intent_router=get_intent_router(),
-        chat_worker=ChatWorker(llm=llm, context_engine=context_engine),
-        rag_worker=(
-            RAGWorker(
-                llm=llm,
-                context_engine=context_engine,
-                rag_pipeline=rag_pipeline,
-                collection_name="__all__",
-            )
-            if rag_pipeline is not None
-            else None
+        chat_worker=chat_worker,
+        rag_worker=rag_worker,
+        tool_worker=tool_worker,
+        orchestrator_worker=OrchestratorWorker(
+            llm=llm,
+            chat_worker=chat_worker,
+            rag_worker=rag_worker,
+            tool_worker=tool_worker,
+            task_decomposer=get_task_decomposer(),
         ),
-        tool_worker=ToolAgentWorker(
-            agent_engine=get_agent_engine(),
-            context_engine=context_engine,
-        ),
+        task_decomposer=get_task_decomposer(),
     )
 
 

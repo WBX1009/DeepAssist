@@ -74,6 +74,14 @@ class StreamEvent(BaseModel):
         return cls(event="context_window_trace", data=data)
 
     @classmethod
+    def multi_agent_plan(cls, data: Dict[str, Any]) -> "StreamEvent":
+        return cls(event="multi_agent_plan", data=data)
+
+    @classmethod
+    def collaborator_trace(cls, data: Dict[str, Any]) -> "StreamEvent":
+        return cls(event="collaborator_trace", data=data)
+
+    @classmethod
     def answer_guard(cls, data: Dict[str, Any]) -> "StreamEvent":
         return cls(event="answer_guard", data=data)
 

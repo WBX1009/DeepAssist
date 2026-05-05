@@ -2,9 +2,11 @@ import re
 from typing import Any, Dict, Iterator, List, Optional
 
 from backend.common.logger import get_logger
+from backend.domain.entities.agent_plan import MultiAgentPlan
 from backend.domain.entities.agent_worker import AgentWorkerType
 from backend.domain.interfaces.llm import BaseLLM
 from backend.services.agent.engine import AgentEngine
+from backend.services.agent.task_decomposer import TaskDecomposer
 from backend.services.context_engine import ContextEngine
 from backend.services.rag.pipeline import RAGPipeline
 
@@ -305,3 +307,175 @@ class ToolAgentWorker(BaseAgentWorker):
             messages,
             model_options=model_options,
         )
+
+
+class OrchestratorWorker(BaseAgentWorker):
+    worker_type = AgentWorkerType.ORCHESTRATOR
+
+    def __init__(
+        self,
+        llm: BaseLLM,
+        chat_worker: BaseAgentWorker,
+        rag_worker: Optional[BaseAgentWorker],
+        tool_worker: BaseAgentWorker,
+        task_decomposer: Optional[TaskDecomposer] = None,
+    ):
+        self.llm = llm
+        self.chat_worker = chat_worker
+        self.rag_worker = rag_worker
+        self.tool_worker = tool_worker
+        self.task_decomposer = task_decomposer or TaskDecomposer()
+
+    def stream(
+        self,
+        query: str,
+        history: List[Dict[str, Any]],
+        user_profile: Optional[str] = None,
+        model_options: Optional[Dict[str, Any]] = None,
+    ) -> Iterator[Dict[str, Any]]:
+        yield {"type": "status", "content": "Supervisor selected OrchestratorWorker"}
+        plan = self.task_decomposer.preview(
+            query,
+            rag_available=self.rag_worker is not None,
+        )
+        yield {"type": "multi_agent_plan", "data": plan.to_trace_data()}
+
+        collaborator_results: List[Dict[str, Any]] = []
+        for task in plan.tasks:
+            worker = self._worker_for(task.worker)
+            task_query = self._build_task_query(query, task.query, collaborator_results)
+            yield {
+                "type": "collaborator_trace",
+                "data": {
+                    "phase": "start",
+                    "task_id": task.task_id,
+                    "title": task.title,
+                    "worker": task.worker.value,
+                    "rationale": task.rationale,
+                },
+            }
+            answer_text = ""
+            for event in worker.stream(
+                query=task_query,
+                history=history,
+                user_profile=user_profile,
+                model_options=model_options,
+            ):
+                event_type = event.get("type")
+                if event_type == "message_delta":
+                    answer_text += event.get("content", "")
+                    continue
+                if event_type == "final_answer":
+                    answer_text = event.get("content", "") or answer_text
+                    continue
+                if event_type == "finish":
+                    finish_messages = event.get("new_messages", [])
+                    if not answer_text:
+                        answer_text = self._extract_finish_answer(finish_messages)
+                    break
+                yield event
+
+            collaborator_results.append(
+                {
+                    "task_id": task.task_id,
+                    "title": task.title,
+                    "worker": task.worker.value,
+                    "answer": answer_text.strip(),
+                }
+            )
+            yield {
+                "type": "collaborator_trace",
+                "data": {
+                    "phase": "finish",
+                    "task_id": task.task_id,
+                    "title": task.title,
+                    "worker": task.worker.value,
+                    "output_preview": (answer_text or "")[:240],
+                },
+            }
+
+        synthesis_messages = self._build_synthesis_messages(
+            query=query,
+            collaborator_results=collaborator_results,
+            user_profile=user_profile,
+        )
+        final_answer = ""
+        for chunk in self.llm.chat_stream(synthesis_messages, **self._model_options(model_options)):
+            final_answer += chunk
+            yield {"type": "message_delta", "content": chunk}
+
+        yield {
+            "type": "finish",
+            "new_messages": [
+                {"role": "assistant", "content": final_answer},
+            ],
+            "worker": self.worker_type.value,
+        }
+
+    def _worker_for(self, worker_type: AgentWorkerType) -> BaseAgentWorker:
+        if worker_type == AgentWorkerType.RAG and self.rag_worker is not None:
+            return self.rag_worker
+        if worker_type == AgentWorkerType.TOOL:
+            return self.tool_worker
+        return self.chat_worker
+
+    def _build_task_query(
+        self,
+        original_query: str,
+        task_query: str,
+        collaborator_results: List[Dict[str, Any]],
+    ) -> str:
+        if not collaborator_results:
+            return task_query or original_query
+
+        findings = "\n".join(
+            f"- {item['title']} ({item['worker']}): {item['answer']}"
+            for item in collaborator_results
+            if item.get("answer")
+        )
+        if not findings:
+            return task_query or original_query
+
+        return (
+            f"Original task:\n{original_query}\n\n"
+            f"Current subtask:\n{task_query or original_query}\n\n"
+            f"Previous collaborator findings:\n{findings}"
+        )
+
+    def _extract_finish_answer(self, messages: List[Dict[str, Any]]) -> str:
+        for message in reversed(messages or []):
+            if message.get("role") == "assistant" and message.get("content"):
+                return str(message.get("content"))
+        return ""
+
+    def _build_synthesis_messages(
+        self,
+        query: str,
+        collaborator_results: List[Dict[str, Any]],
+        user_profile: Optional[str] = None,
+    ) -> List[Dict[str, Any]]:
+        system_prompt = (
+            "You are the final synthesis coordinator for DeepAssist. "
+            "Merge collaborator findings into one clear, direct answer. "
+            "If collaborators disagree or some evidence is weak, say so explicitly."
+        )
+        if user_profile:
+            system_prompt = f"{system_prompt}\n\n[User Profile]\n{user_profile}"
+
+        findings = "\n\n".join(
+            (
+                f"[{item['task_id']}] {item['title']} | worker={item['worker']}\n"
+                f"{item['answer'] or '(no useful result)'}"
+            )
+            for item in collaborator_results
+        )
+        user_prompt = (
+            f"Original user task:\n{query}\n\n"
+            f"Collaborator findings:\n{findings}\n\n"
+            "Produce the final answer for the user. "
+            "Do not mention internal worker names unless it improves clarity."
+        )
+        return [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_prompt},
+        ]

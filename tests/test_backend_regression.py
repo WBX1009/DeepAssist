@@ -7,6 +7,7 @@ from backend.application.agent_app import AgentApplication
 from backend.application.chat_app import ChatApplication
 from backend.application.kb_app import KnowledgeBaseApp
 from backend.domain.entities.agent_run import AgentRunConfig
+from backend.domain.entities.agent_plan import MultiAgentPlan
 from backend.domain.entities.agent_worker import AgentWorkerType
 from backend.domain.entities.document import DocumentChunk
 from backend.domain.entities.knowledge_base import KnowledgeBaseHealthReport
@@ -19,8 +20,9 @@ from backend.infrastructure.tools.rag_tool import KnowledgeBaseTool
 from backend.services.agent.engine import AgentEngine
 from backend.services.agent.intent_router import IntentRouter
 from backend.services.agent.supervisor import AgentSupervisor
+from backend.services.agent.task_decomposer import TaskDecomposer
 from backend.services.agent.tooling import ToolRegistry
-from backend.services.agent.workers import ToolAgentWorker
+from backend.services.agent.workers import OrchestratorWorker, ToolAgentWorker
 from backend.services.context_engine import ContextEngine
 from backend.services.rag.answer_guard import SourceAwareResponseGuard
 from backend.services.rag.fusion import HybridRetriever
@@ -257,6 +259,41 @@ class FakeKeywordDB:
                 }
             ],
         }
+
+
+class FakeCollaboratorWorker:
+    def __init__(self, content: str, extra_events: list[dict[str, Any]] | None = None):
+        self.content = content
+        self.extra_events = extra_events or []
+        self.calls: list[dict[str, Any]] = []
+
+    def stream(self, query: str, history, user_profile=None, model_options=None):
+        self.calls.append(
+            {
+                "query": query,
+                "history": history,
+                "user_profile": user_profile,
+                "model_options": model_options,
+            }
+        )
+        for event in self.extra_events:
+            yield event
+        yield {
+            "type": "finish",
+            "new_messages": [{"role": "assistant", "content": self.content}],
+            "worker": "fake_worker",
+        }
+
+
+class FakeSynthesisLLM:
+    def __init__(self, chunks: list[str]):
+        self.chunks = chunks
+        self.calls: list[list[dict[str, Any]]] = []
+
+    def chat_stream(self, messages, model_name=None, temperature=None, top_p=None):
+        self.calls.append(messages)
+        for chunk in self.chunks:
+            yield chunk
 
 
 class BackendRegressionTests(unittest.TestCase):
@@ -908,6 +945,70 @@ class BackendRegressionTests(unittest.TestCase):
             recovery_events[-1]["data"].get("successful_tool_calls"),
             1,
         )
+
+    def test_agent_supervisor_routes_complex_mixed_task_to_orchestrator(self):
+        supervisor = AgentSupervisor(
+            intent_router=IntentRouter(),
+            chat_worker=object(),
+            rag_worker=object(),
+            tool_worker=object(),
+            orchestrator_worker=object(),
+            task_decomposer=TaskDecomposer(),
+        )
+
+        decision = supervisor.decide(
+            "请根据知识库检索 DeepSeek 文档，然后调用 Python 做计算，最后综合总结。"
+        )
+
+        self.assertEqual(decision.worker, AgentWorkerType.ORCHESTRATOR)
+        self.assertTrue(any(signal in decision.signals for signal in ["然后", "综合", "调用"]))
+
+    def test_orchestrator_worker_decomposes_and_synthesizes_collaborator_results(self):
+        rag_worker = FakeCollaboratorWorker(
+            "RAG evidence: API Key is created in console.",
+            extra_events=[
+                {
+                    "type": "retrieval_trace",
+                    "data": {"hit_count": 2, "candidate_k": 10, "fusion": "weighted_rrf"},
+                }
+            ],
+        )
+        tool_worker = FakeCollaboratorWorker("Tool result: computed delta is 4.4.")
+        chat_worker = FakeCollaboratorWorker("Chat framing: answer concisely.")
+        llm = FakeSynthesisLLM(["Final", " synthesized", " answer"])
+        worker = OrchestratorWorker(
+            llm=llm,
+            chat_worker=chat_worker,
+            rag_worker=rag_worker,
+            tool_worker=tool_worker,
+            task_decomposer=TaskDecomposer(),
+        )
+
+        events = list(
+            worker.stream(
+                query="请根据知识库检索 DeepSeek 文档，然后调用 Python 做计算，最后综合总结。",
+                history=[],
+            )
+        )
+
+        plan_events = [event for event in events if event.get("type") == "multi_agent_plan"]
+        collaborator_events = [
+            event for event in events if event.get("type") == "collaborator_trace"
+        ]
+        final_chunks = [
+            event.get("content", "")
+            for event in events
+            if event.get("type") == "message_delta"
+        ]
+
+        self.assertTrue(plan_events)
+        self.assertEqual(plan_events[0]["data"].get("task_count"), 2)
+        self.assertGreaterEqual(len(collaborator_events), 4)
+        self.assertEqual("".join(final_chunks), "Final synthesized answer")
+        self.assertTrue(llm.calls)
+        synthesis_prompt = llm.calls[0][1]["content"]
+        self.assertIn("RAG evidence", synthesis_prompt)
+        self.assertIn("Tool result", synthesis_prompt)
 
 
 if __name__ == "__main__":

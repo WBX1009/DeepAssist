@@ -5,6 +5,7 @@ from backend.domain.entities.agent_worker import (
     SupervisorDecision,
 )
 from backend.domain.entities.intent import IntentDecision, IntentType
+from backend.services.agent.task_decomposer import TaskDecomposer
 from backend.services.agent.intent_router import IntentRouter
 from backend.services.agent.workers import BaseAgentWorker
 
@@ -18,11 +19,15 @@ class AgentSupervisor:
         chat_worker: BaseAgentWorker,
         rag_worker: Optional[BaseAgentWorker],
         tool_worker: BaseAgentWorker,
+        orchestrator_worker: Optional[BaseAgentWorker] = None,
+        task_decomposer: Optional[TaskDecomposer] = None,
     ):
         self.intent_router = intent_router
         self.chat_worker = chat_worker
         self.rag_worker = rag_worker
         self.tool_worker = tool_worker
+        self.orchestrator_worker = orchestrator_worker
+        self.task_decomposer = task_decomposer or TaskDecomposer()
 
     def decide(self, query: str) -> SupervisorDecision:
         if self.intent_router.is_tool_inventory_query(query):
@@ -50,6 +55,26 @@ class AgentSupervisor:
                 worker=AgentWorkerType.TOOL,
                 intent=intent,
                 reason="knowledge-base catalog query detected; routed to tool_agent_worker",
+                signals=intent.signals,
+            )
+
+        if self.orchestrator_worker is not None and self.task_decomposer.should_orchestrate(
+            query,
+            rag_available=self.rag_worker is not None,
+        ):
+            intent = IntentDecision(
+                intent=IntentType.AGENT,
+                confidence=0.9,
+                reason="complex multi-capability task detected",
+                signals=self.task_decomposer.preview(
+                    query,
+                    rag_available=self.rag_worker is not None,
+                ).signals,
+            )
+            return SupervisorDecision(
+                worker=AgentWorkerType.ORCHESTRATOR,
+                intent=intent,
+                reason="complex task detected; routed to orchestrator_worker",
                 signals=intent.signals,
             )
 
@@ -99,6 +124,11 @@ class AgentSupervisor:
         )
 
     def _worker_for(self, worker_type: AgentWorkerType) -> BaseAgentWorker:
+        if (
+            worker_type == AgentWorkerType.ORCHESTRATOR
+            and self.orchestrator_worker is not None
+        ):
+            return self.orchestrator_worker
         if worker_type == AgentWorkerType.RAG and self.rag_worker is not None:
             return self.rag_worker
         if worker_type == AgentWorkerType.TOOL:
@@ -106,6 +136,8 @@ class AgentSupervisor:
         return self.chat_worker
 
     def _worker_kind(self, worker_type: AgentWorkerType) -> str:
+        if worker_type == AgentWorkerType.ORCHESTRATOR:
+            return "orchestrator"
         if worker_type == AgentWorkerType.RAG:
             return "rag"
         if worker_type == AgentWorkerType.TOOL:
