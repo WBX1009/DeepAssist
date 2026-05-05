@@ -1,5 +1,6 @@
 from abc import ABC, abstractmethod
 from typing import List, Dict, Any, Optional
+from backend.domain.entities.context_window import ContextSummary
 from backend.domain.entities.message import Message
 from backend.domain.entities.task_snapshot import TaskSnapshot
 
@@ -46,4 +47,16 @@ class BaseMemoryStore(ABC):
 
     @abstractmethod
     def clear_task_snapshot(self, session_id: str) -> bool:
+        pass
+
+    @abstractmethod
+    def get_session_summary(self, session_id: str) -> Optional[ContextSummary]:
+        pass
+
+    @abstractmethod
+    def save_session_summary(self, session_id: str, summary: ContextSummary) -> bool:
+        pass
+
+    @abstractmethod
+    def clear_session_summary(self, session_id: str) -> bool:
         pass

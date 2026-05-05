@@ -54,6 +54,7 @@ class ContextSummary(BaseModel):
     """Compressed representation of dropped history turns."""
 
     content: str
+    source: str = Field(default="runtime")
     source_turn_ids: List[str] = Field(default_factory=list)
     dropped_turn_count: int = Field(default=0, ge=0)
     dropped_message_count: int = Field(default=0, ge=0)
@@ -64,6 +65,7 @@ class ContextSummary(BaseModel):
 
     def to_trace_data(self) -> Dict[str, Any]:
         return {
+            "source": self.source,
             "dropped_turn_count": self.dropped_turn_count,
             "dropped_message_count": self.dropped_message_count,
             "reason_counts": dict(self.reason_counts),

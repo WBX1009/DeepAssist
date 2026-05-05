@@ -41,6 +41,7 @@ class SessionManager:
         use_long_term_memory: bool = False,
     ) -> ContextWindowPlan:
         safe_budget = max(1, max_rounds)
+        persisted_summary = self.store.get_session_summary(session_id)
         recalled_memories = (
             self._recall_long_term_memories(query, safe_budget)
             if use_long_term_memory
@@ -57,7 +58,13 @@ class SessionManager:
         if plan.dropped_turns:
             summary = self.summary_compressor.compress(plan.dropped_turns)
             if summary is not None:
+                persisted_copy = summary.model_copy(update={"source": "persisted"})
+                self.store.save_session_summary(session_id, persisted_copy)
                 plan = plan.model_copy(update={"summary": summary})
+        elif persisted_summary is not None:
+            plan = plan.model_copy(
+                update={"summary": persisted_summary.model_copy(update={"source": "persisted"})}
+            )
         if recalled_memories:
             plan = plan.model_copy(update={"recalled_memories": recalled_memories, "budget": safe_budget})
         else:
@@ -130,6 +137,8 @@ class SessionManager:
     def delete_session(self, session_id: str) -> bool:
         success = self.store.clear_history(session_id)
         if success:
+            self.store.clear_task_snapshot(session_id)
+            self.store.clear_session_summary(session_id)
             logger.info("Deleted session lifecycle for %s", session_id)
         return success
 

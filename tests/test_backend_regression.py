@@ -6,6 +6,7 @@ from typing import Any
 from backend.application.agent_app import AgentApplication
 from backend.application.chat_app import ChatApplication
 from backend.application.kb_app import KnowledgeBaseApp
+from backend.domain.entities.context_window import ContextSummary
 from backend.domain.entities.agent_run import AgentRunConfig
 from backend.domain.entities.agent_plan import MultiAgentPlan
 from backend.domain.entities.agent_worker import AgentWorkerType
@@ -36,6 +37,7 @@ class FakeMemoryStore(BaseMemoryStore):
         self.messages: dict[str, list[Any]] = {}
         self.profiles: dict[str, str] = {}
         self.task_snapshots: dict[str, TaskSnapshot] = {}
+        self.session_summaries: dict[str, ContextSummary] = {}
 
     def get_history(self, session_id: str, limit: int = 10):
         return list(self.messages.get(session_id, []))[-limit:]
@@ -70,6 +72,17 @@ class FakeMemoryStore(BaseMemoryStore):
 
     def clear_task_snapshot(self, session_id: str) -> bool:
         self.task_snapshots.pop(session_id, None)
+        return True
+
+    def get_session_summary(self, session_id: str):
+        return self.session_summaries.get(session_id)
+
+    def save_session_summary(self, session_id: str, summary: ContextSummary) -> bool:
+        self.session_summaries[session_id] = summary
+        return True
+
+    def clear_session_summary(self, session_id: str) -> bool:
+        self.session_summaries.pop(session_id, None)
         return True
 
 
@@ -600,6 +613,50 @@ class BackendRegressionTests(unittest.TestCase):
         self.assertIn("recalled_memories", trace_data)
         self.assertEqual(trace_data["recalled_memory_count"], len(plan.recalled_memories))
         self.assertTrue(trace_data["summary_injected"] or trace_data["dropped_turn_count"] == 0)
+
+    def test_persisted_session_summary_is_injected_when_runtime_summary_is_absent(self):
+        store = FakeMemoryStore()
+        store.save_session_summary(
+            "session-persisted-summary",
+            ContextSummary(
+                content="[Conversation Summary]\nPersisted earlier context.",
+                source="persisted",
+                source_turn_ids=["turn-0"],
+                dropped_turn_count=1,
+                dropped_message_count=2,
+                reason_counts={"recent_turn": 1},
+            ),
+        )
+        session_manager = SessionManager(store)
+        session_manager.save_interaction("session-persisted-summary", "latest question", "latest answer")
+
+        plan = session_manager.plan_chat_context(
+            "session-persisted-summary",
+            max_rounds=6,
+            query="follow up",
+            use_long_term_memory=False,
+        )
+
+        self.assertIsNotNone(plan.summary)
+        self.assertEqual(plan.summary.source, "persisted")
+        self.assertIn("Persisted earlier context", plan.summary.content)
+
+    def test_long_term_memory_recall_matches_style_preference_synonyms(self):
+        store = FakeMemoryStore()
+        store.set_profile("user_facts", '["I prefer concise answers."]')
+        store.set_profile("topics", '["architecture"]')
+        session_manager = SessionManager(store)
+
+        plan = session_manager.plan_chat_context(
+            "session-style-memory",
+            max_rounds=5,
+            query="Please keep it short when you explain the architecture.",
+            use_long_term_memory=True,
+        )
+
+        recalled = [memory.content for memory in plan.recalled_memories]
+        self.assertTrue(recalled)
+        self.assertTrue(any("concise answers" in item for item in recalled))
 
     def test_chat_stream_emits_context_window_trace_event(self):
         store = FakeMemoryStore()

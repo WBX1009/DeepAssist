@@ -4,6 +4,7 @@ import json
 from typing import List, Dict, Any, Optional
 
 from backend.domain.interfaces.memory_db import BaseMemoryStore
+from backend.domain.entities.context_window import ContextSummary
 from backend.domain.entities.message import Message, AIMessage
 from backend.domain.entities.task_snapshot import TaskSnapshot
 from backend.common.config import settings
@@ -59,6 +60,18 @@ class SQLiteMemoryStore(BaseMemoryStore):
                         route_worker TEXT NOT NULL,
                         status TEXT NOT NULL,
                         payload TEXT,
+                        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                    )
+                """)
+                cursor.execute("""
+                    CREATE TABLE IF NOT EXISTS session_summaries (
+                        session_id TEXT PRIMARY KEY,
+                        content TEXT NOT NULL,
+                        source TEXT NOT NULL,
+                        source_turn_ids TEXT,
+                        dropped_turn_count INTEGER NOT NULL,
+                        dropped_message_count INTEGER NOT NULL,
+                        reason_counts TEXT,
                         updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                     )
                 """)
@@ -139,6 +152,8 @@ class SQLiteMemoryStore(BaseMemoryStore):
             with self._get_connection() as conn:
                 cursor = conn.cursor()
                 cursor.execute("DELETE FROM messages WHERE session_id = ?", (session_id,))
+                cursor.execute("DELETE FROM session_summaries WHERE session_id = ?", (session_id,))
+                cursor.execute("DELETE FROM task_snapshots WHERE session_id = ?", (session_id,))
                 conn.commit()
             return True
         except Exception as e:
@@ -297,4 +312,79 @@ class SQLiteMemoryStore(BaseMemoryStore):
             return True
         except Exception as e:
             logger.error(f"Failed to clear task snapshot [{session_id}]: {e}")
+            return False
+
+    def get_session_summary(self, session_id: str) -> Optional[ContextSummary]:
+        try:
+            with self._get_connection() as conn:
+                cursor = conn.cursor()
+                cursor.execute(
+                    """
+                    SELECT content, source, source_turn_ids, dropped_turn_count,
+                           dropped_message_count, reason_counts
+                    FROM session_summaries
+                    WHERE session_id = ?
+                    """,
+                    (session_id,),
+                )
+                row = cursor.fetchone()
+                if not row:
+                    return None
+                return ContextSummary(
+                    content=row[0],
+                    source=row[1] or "persisted",
+                    source_turn_ids=json.loads(row[2]) if row[2] else [],
+                    dropped_turn_count=int(row[3] or 0),
+                    dropped_message_count=int(row[4] or 0),
+                    reason_counts=json.loads(row[5]) if row[5] else {},
+                )
+        except Exception as e:
+            logger.error(f"Failed to read session summary [{session_id}]: {e}")
+            return None
+
+    def save_session_summary(self, session_id: str, summary: ContextSummary) -> bool:
+        try:
+            with self._get_connection() as conn:
+                cursor = conn.cursor()
+                cursor.execute(
+                    """
+                    INSERT INTO session_summaries (
+                        session_id, content, source, source_turn_ids, dropped_turn_count,
+                        dropped_message_count, reason_counts, updated_at
+                    )
+                    VALUES (?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+                    ON CONFLICT(session_id) DO UPDATE SET
+                        content = excluded.content,
+                        source = excluded.source,
+                        source_turn_ids = excluded.source_turn_ids,
+                        dropped_turn_count = excluded.dropped_turn_count,
+                        dropped_message_count = excluded.dropped_message_count,
+                        reason_counts = excluded.reason_counts,
+                        updated_at = CURRENT_TIMESTAMP
+                    """,
+                    (
+                        session_id,
+                        summary.content,
+                        summary.source,
+                        json.dumps(summary.source_turn_ids, ensure_ascii=False),
+                        summary.dropped_turn_count,
+                        summary.dropped_message_count,
+                        json.dumps(summary.reason_counts, ensure_ascii=False),
+                    ),
+                )
+                conn.commit()
+            return True
+        except Exception as e:
+            logger.error(f"Failed to save session summary [{session_id}]: {e}")
+            return False
+
+    def clear_session_summary(self, session_id: str) -> bool:
+        try:
+            with self._get_connection() as conn:
+                cursor = conn.cursor()
+                cursor.execute("DELETE FROM session_summaries WHERE session_id = ?", (session_id,))
+                conn.commit()
+            return True
+        except Exception as e:
+            logger.error(f"Failed to clear session summary [{session_id}]: {e}")
             return False
