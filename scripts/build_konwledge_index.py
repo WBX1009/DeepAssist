@@ -1,67 +1,122 @@
-import os
-import sys
-import json
-import re
 import hashlib
+import json
+import os
+import re
 import signal
+import sys
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterator, List, Tuple
-from tqdm import tqdm
-import pandas as pd
+from typing import Callable, Dict, Iterator, List, Tuple
 
-# 系统资源与环境配置
+import pandas as pd
+from tqdm import tqdm
+
 os.environ["HF_HUB_OFFLINE"] = "1"
 os.environ["TRANSFORMERS_OFFLINE"] = "1"
-os.environ["CUDA_VISIBLE_DEVICES"] = "2" 
+os.environ.setdefault("CUDA_VISIBLE_DEVICES", "2")
 
-project_root = str(Path(__file__).resolve().parent.parent)
-if project_root not in sys.path: sys.path.append(project_root)
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.append(str(PROJECT_ROOT))
 
 from backend.common.config import settings
 from backend.common.logger import get_logger
 from backend.domain.entities.document import DocumentChunk
-from backend.infrastructure.embeddings.bge_m3_local import BGEM3Local
 from backend.infrastructure.databases.chroma_store import ChromaStore
+from backend.infrastructure.databases.kb_manifest_store import KnowledgeBaseManifestStore
 from backend.infrastructure.databases.whoosh_store import WhooshStore
+from backend.infrastructure.embeddings.bge_m3_local import BGEM3Local
 from backend.services.rag.chunking import DocumentChunker
 
-logger = get_logger("Server_Build_Index")
+logger = get_logger("build_knowledge_index")
 
-# ==========================================
-# 🎛️ 核心配置：每个原始文件的最大读取行数/样本数
-# ==========================================
-# 设置为 float('inf') 代表全量入库，设置为 50000 适合快速验证与开发。
-MAX_SAMPLES_PER_FILE = 50000  
-
-# ==========================================
-# 🛑 全局中断信号监听 (Graceful Shutdown)
-# ==========================================
+INGEST_SCHEMA_VERSION = "kb_contract_v2"
+MAX_SAMPLES_PER_FILE = int(os.getenv("DEEPASSIST_MAX_SAMPLES_PER_FILE", "50000"))
+DEFAULT_BATCH_SIZE = int(os.getenv("DEEPASSIST_INGEST_BATCH_SIZE", "1024"))
 SHUTDOWN_REQUESTED = False
 
+
 def signal_handler(sig, frame):
+    del sig, frame
     global SHUTDOWN_REQUESTED
-    if not SHUTDOWN_REQUESTED:
-        print("\n" + "!"*60)
-        print("🛑 接收到中断信号 (Ctrl+C)！")
-        print("⏳ 正在安全释放资源，请等待当前批次入库完成...")
-        print("⚠️ 请不要再次按 Ctrl+C，否则可能导致数据库死锁！")
-        print("!"*60 + "\n")
-        SHUTDOWN_REQUESTED = True
+    if SHUTDOWN_REQUESTED:
+        return
+    SHUTDOWN_REQUESTED = True
+    print("\n" + "=" * 72)
+    print("Received Ctrl+C. Finishing the current batch safely before shutdown...")
+    print("=" * 72 + "\n")
+
 
 signal.signal(signal.SIGINT, signal_handler)
 
-def generate_structural_id(file_path: str, index: int, sub_type: str = "") -> str:
-    raw_str = f"{file_path}_{index}_{sub_type}"
-    return hashlib.md5(raw_str.encode('utf-8')).hexdigest()
+
+@dataclass(frozen=True)
+class IngestTask:
+    collection_name: str
+    path: Path
+    adapter: Callable[["IngestTask", int], Iterator[Tuple[DocumentChunk, int]]]
+    domain: str
+    source_format: str
+    language: str
 
 
-def sanitize_metadata(metadata: dict) -> dict:
-    sanitized = {}
+class ProgressManager:
+    def __init__(self, progress_path: str):
+        self.progress_file = Path(progress_path)
+        self.progress_file.parent.mkdir(parents=True, exist_ok=True)
+        self.progress = self._load()
+
+    def _load(self) -> dict:
+        if not self.progress_file.exists():
+            return {}
+        try:
+            with self.progress_file.open("r", encoding="utf-8") as handle:
+                payload = json.load(handle)
+            return payload if isinstance(payload, dict) else {}
+        except Exception:
+            return {}
+
+    def get_last_index(self, file_path: str) -> int:
+        return int(self.progress.get(file_path, -1))
+
+    def save_index(self, file_path: str, index: int) -> None:
+        self.progress[file_path] = int(index)
+        with self.progress_file.open("w", encoding="utf-8") as handle:
+            json.dump(self.progress, handle, ensure_ascii=False, indent=2)
+
+
+def stable_source_file(path: Path) -> str:
+    try:
+        return path.resolve().relative_to(PROJECT_ROOT).as_posix()
+    except Exception:
+        return path.as_posix()
+
+
+def stable_chunk_id(source_file: str, record_index: int, local_key: str = "") -> str:
+    raw = f"{source_file}::{record_index}::{local_key}"
+    return hashlib.md5(raw.encode("utf-8")).hexdigest()
+
+
+def normalize_whitespace(text: str) -> str:
+    return re.sub(r"\s+", " ", text or "").strip()
+
+
+def truncate(text: str, limit: int = 160) -> str:
+    text = normalize_whitespace(text)
+    if len(text) <= limit:
+        return text
+    return f"{text[:limit]}..."
+
+
+def sanitize_metadata(metadata: Dict[str, object]) -> Dict[str, object]:
+    sanitized: Dict[str, object] = {}
     for key, value in metadata.items():
         if value is None:
             continue
         if isinstance(value, (str, int, float, bool)):
             sanitized[key] = value
+        elif isinstance(value, Path):
+            sanitized[key] = value.as_posix()
         elif isinstance(value, (list, tuple)):
             sanitized[key] = [str(item) for item in value if item is not None]
         elif isinstance(value, dict):
@@ -74,214 +129,421 @@ def sanitize_metadata(metadata: dict) -> dict:
             sanitized[key] = str(value)
     return sanitized
 
-class ProgressManager:
-    def __init__(self):
-        self.progress_file = Path(settings.INGEST_PROGRESS_PATH)
-        self.progress_file.parent.mkdir(parents=True, exist_ok=True)
-        self.progress = self._load()
 
-    def _load(self) -> dict:
-        if self.progress_file.exists():
-            with open(self.progress_file, "r", encoding="utf-8") as f: return json.load(f)
-        return {}
+def build_metadata(
+    task: IngestTask,
+    record_index: int,
+    source_file: str,
+    source_type: str,
+    source_title: str = "",
+    extra: Dict[str, object] | None = None,
+) -> Dict[str, object]:
+    metadata = {
+        "schema_version": INGEST_SCHEMA_VERSION,
+        "collection_name": task.collection_name,
+        "source_file": source_file,
+        "source_path": source_file,
+        "source_display_name": Path(source_file).name,
+        "domain": task.domain,
+        "source_format": task.source_format,
+        "source_type": source_type,
+        "language": task.language,
+        "record_index": int(record_index),
+        "source_title": truncate(source_title, 180),
+        "ingestion_pipeline": "offline_build_script_v2",
+    }
+    if extra:
+        metadata.update(extra)
+    return sanitize_metadata(metadata)
 
-    def get_last_index(self, file_path: str) -> int:
-        return self.progress.get(str(file_path), -1)
 
-    def save_index(self, file_path: str, index: int):
-        self.progress[str(file_path)] = index
-        with open(self.progress_file, "w", encoding="utf-8") as f:
-            json.dump(self.progress, f, ensure_ascii=False)
+def make_qa_chunk(
+    task: IngestTask,
+    source_file: str,
+    record_index: int,
+    question: str,
+    answer: str,
+    local_key: str = "qa",
+    extra: Dict[str, object] | None = None,
+) -> DocumentChunk:
+    question_text = normalize_whitespace(question)
+    answer_text = normalize_whitespace(answer)
+    content = f"Q: {question_text}\nA: {answer_text}"
+    metadata = build_metadata(
+        task=task,
+        record_index=record_index,
+        source_file=source_file,
+        source_type="qa",
+        source_title=question_text,
+        extra=extra,
+    )
+    return DocumentChunk(
+        id=stable_chunk_id(source_file, record_index, local_key),
+        content=content,
+        metadata=metadata,
+    )
 
-# ==========================================
-# 🧩 适配器 (加入上限截断)
-# ==========================================
-def adapter_medical(file_path: str, start_idx: int) -> Iterator[Tuple[DocumentChunk, int]]:
-    with open(file_path, "r", encoding="utf-8") as f:
-        for idx, line in enumerate(f):
-            if idx >= MAX_SAMPLES_PER_FILE: break # 🟢 达到上限直接停止读取
-            if idx <= start_idx: continue
-            if not line.strip(): continue
+
+def adapter_medical(task: IngestTask, start_idx: int) -> Iterator[Tuple[DocumentChunk, int]]:
+    source_file = stable_source_file(task.path)
+    with task.path.open("r", encoding="utf-8") as handle:
+        for row_index, line in enumerate(handle):
+            if row_index >= MAX_SAMPLES_PER_FILE:
+                break
+            if row_index <= start_idx or not line.strip():
+                continue
             try:
-                data = json.loads(line)
-                content = f"Q: {data.get('instruction', '') + data.get('input', '')}\nA: {data.get('output', '')}"
-                yield DocumentChunk(
-                    id=generate_structural_id(file_path, idx),
-                    content=content,
-                    metadata=sanitize_metadata(
-                        {"source_file": file_path, "domain": "medical", "type": "qa"}
-                    ),
-                ), idx
-            except: continue
-
-def adapter_legal(file_path: str, start_idx: int) -> Iterator[Tuple[DocumentChunk, int]]:
-    with open(file_path, "r", encoding="utf-8") as f:
-        for idx, line in enumerate(f):
-            if idx >= MAX_SAMPLES_PER_FILE: break
-            if idx <= start_idx: continue
-            if not line.strip(): continue
-            try:
-                data = json.loads(line)
-                content = f"Q: {data.get('input', '')}\nA: {data.get('output', '')}"
-                yield DocumentChunk(
-                    id=data.get("id", generate_structural_id(file_path, idx)),
-                    content=content,
-                    metadata=sanitize_metadata(
-                        {"source_file": file_path, "domain": "legal", "type": "qa"}
-                    ),
-                ), idx
-            except: continue
-
-def adapter_financial(file_path: str, start_idx: int) -> Iterator[Tuple[DocumentChunk, int]]:
-    with open(file_path, "r", encoding="utf-8") as f:
-        data_list = json.load(f)
-        for idx, data in enumerate(data_list):
-            if idx >= MAX_SAMPLES_PER_FILE: break
-            if idx <= start_idx: continue
-            instruction = data.get('instruction', '')
-            input_text = data.get('input', '')
-            raw_output = data.get('output', '')
-
-            clean_output = re.sub(r'\[Calculator.*?\]', '', raw_output)
-
-            content = f"Q: {instruction + input_text}\nA: {clean_output}"
-            yield DocumentChunk(
-                id=generate_structural_id(file_path, idx),
-                content=content,
-                metadata=sanitize_metadata(
-                    {"source_file": file_path, "domain": "finance", "type": "qa"}
+                payload = json.loads(line)
+            except Exception:
+                continue
+            question = f"{payload.get('instruction', '')}{payload.get('input', '')}"
+            answer = payload.get("output", "")
+            yield (
+                make_qa_chunk(
+                    task=task,
+                    source_file=source_file,
+                    record_index=row_index,
+                    question=question,
+                    answer=answer,
+                    extra={"dataset_name": "medical_qa"},
                 ),
-            ), idx
-
-def adapter_enron(file_path: str, start_idx: int) -> Iterator[Tuple[DocumentChunk, int]]:
-    chunker = DocumentChunker()
-    df = pd.read_parquet(file_path)
-    for row_idx, row in df.iterrows():
-        if row_idx >= MAX_SAMPLES_PER_FILE: break
-        if row_idx <= start_idx: continue
-        email_content = row.get("email", "")
-        if not email_content: continue
-        questions, gold_answers = row.get("questions",[]), row.get("gold_answers",[])
-        if isinstance(questions, (list, tuple)) and isinstance(gold_answers, (list, tuple)):
-            for qa_idx, (q, a) in enumerate(zip(questions, gold_answers)):
-                yield DocumentChunk(
-                    id=generate_structural_id(file_path, row_idx, f"qa_{qa_idx}"),
-                    content=f"Q: {q}\nA: {a}",
-                    metadata=sanitize_metadata(
-                        {"source_file": file_path, "domain": "office", "type": "qa"}
-                    ),
-                ), row_idx
-        for chunk_idx, c in enumerate(chunker.split_markdown(email_content, source_name="enron")):
-            c.id = generate_structural_id(file_path, row_idx, f"email_chunk_{chunk_idx}")
-            c.metadata.update(
-                sanitize_metadata(
-                    {"source_file": file_path, "domain": "office", "type": "email"}
-                )
+                row_index,
             )
-            yield c, row_idx
 
-# ==========================================
-# ⚙️ 串行安全引擎
-# ==========================================
-def ingest_file_to_db(collection_name: str, file_path: str, adapter_func, 
-                      embedding_model: BGEM3Local, vector_db: ChromaStore, keyword_db: WhooshStore, 
-                      progress_mgr: ProgressManager, batch_size: int = 1024):
-    
+
+def adapter_legal(task: IngestTask, start_idx: int) -> Iterator[Tuple[DocumentChunk, int]]:
+    source_file = stable_source_file(task.path)
+    with task.path.open("r", encoding="utf-8") as handle:
+        for row_index, line in enumerate(handle):
+            if row_index >= MAX_SAMPLES_PER_FILE:
+                break
+            if row_index <= start_idx or not line.strip():
+                continue
+            try:
+                payload = json.loads(line)
+            except Exception:
+                continue
+            yield (
+                make_qa_chunk(
+                    task=task,
+                    source_file=source_file,
+                    record_index=row_index,
+                    question=payload.get("input", ""),
+                    answer=payload.get("output", ""),
+                    local_key=str(payload.get("id", "qa")),
+                    extra={"dataset_name": "disc_law_sft"},
+                ),
+                row_index,
+            )
+
+
+def adapter_financial(task: IngestTask, start_idx: int) -> Iterator[Tuple[DocumentChunk, int]]:
+    source_file = stable_source_file(task.path)
+    with task.path.open("r", encoding="utf-8") as handle:
+        payloads = json.load(handle)
+
+    for row_index, payload in enumerate(payloads):
+        if row_index >= MAX_SAMPLES_PER_FILE:
+            break
+        if row_index <= start_idx:
+            continue
+        raw_output = payload.get("output", "")
+        clean_output = re.sub(r"\[Calculator.*?\]", "", raw_output)
+        yield (
+            make_qa_chunk(
+                task=task,
+                source_file=source_file,
+                record_index=row_index,
+                question=f"{payload.get('instruction', '')}{payload.get('input', '')}",
+                answer=clean_output,
+                extra={"dataset_name": "disc_fin_sft"},
+            ),
+            row_index,
+        )
+
+
+def adapter_enron(task: IngestTask, start_idx: int) -> Iterator[Tuple[DocumentChunk, int]]:
+    source_file = stable_source_file(task.path)
+    chunker = DocumentChunker()
+    frame = pd.read_parquet(task.path)
+
+    for row_index, row in frame.iterrows():
+        if row_index >= MAX_SAMPLES_PER_FILE:
+            break
+        if row_index <= start_idx:
+            continue
+
+        questions = row.get("questions", []) or []
+        answers = row.get("gold_answers", []) or []
+        if isinstance(questions, (list, tuple)) and isinstance(answers, (list, tuple)):
+            for qa_index, (question, answer) in enumerate(zip(questions, answers)):
+                yield (
+                    make_qa_chunk(
+                        task=task,
+                        source_file=source_file,
+                        record_index=int(row_index),
+                        question=str(question),
+                        answer=str(answer),
+                        local_key=f"qa::{qa_index}",
+                        extra={
+                            "dataset_name": "enron_qa_0922",
+                            "qa_pair_index": qa_index,
+                        },
+                    ),
+                    int(row_index),
+                )
+
+        email_content = str(row.get("email", "") or "")
+        if not email_content.strip():
+            continue
+        for chunk_index, chunk in enumerate(
+            chunker.split_markdown(email_content, source_name=source_file)
+        ):
+            merged_metadata = {
+                **chunk.metadata,
+                **build_metadata(
+                    task=task,
+                    record_index=int(row_index),
+                    source_file=source_file,
+                    source_type="email",
+                    source_title=str(row.get("subject", "") or row.get("file", "") or "email"),
+                    extra={
+                        "dataset_name": "enron_qa_0922",
+                        "chunk_kind": "email_body",
+                        "email_chunk_index": chunk_index,
+                    },
+                ),
+            }
+            chunk.id = stable_chunk_id(source_file, int(row_index), f"email::{chunk_index}")
+            chunk.metadata = sanitize_metadata(merged_metadata)
+            yield chunk, int(row_index)
+
+
+def existing_manifest_chunk_count(
+    manifest_store: KnowledgeBaseManifestStore,
+    collection_name: str,
+    source_file: str,
+) -> int:
+    for item in manifest_store.list_files(collection_name):
+        if item.get("source_file") == source_file:
+            return int(item.get("chunk_count", 0) or 0)
+    return 0
+
+
+def reset_file_state(
+    task: IngestTask,
+    source_file: str,
+    vector_db: ChromaStore,
+    keyword_db: WhooshStore,
+) -> None:
+    logger.info("Resetting historical chunks for %s", source_file)
+    vector_db.delete_by_source(task.collection_name, source_file)
+    keyword_db.delete_by_source(task.collection_name, source_file)
+
+
+def ingest_file_to_db(
+    task: IngestTask,
+    embedding_model: BGEM3Local,
+    vector_db: ChromaStore,
+    keyword_db: WhooshStore,
+    progress_mgr: ProgressManager,
+    manifest_store: KnowledgeBaseManifestStore,
+    batch_size: int = DEFAULT_BATCH_SIZE,
+) -> None:
     global SHUTDOWN_REQUESTED
-    start_idx = progress_mgr.get_last_index(file_path)
-    
-    # 逻辑防御：如果之前已经跑到上限了，直接跳过，防止反复清空重建
-    if start_idx >= MAX_SAMPLES_PER_FILE - 1:
-        logger.info(f"⏭️ 文件 {Path(file_path).name} 已达到预设上限 ({MAX_SAMPLES_PER_FILE})，跳过...")
-        return
+
+    source_file = stable_source_file(task.path)
+    progress_key = str(task.path.resolve())
+    start_idx = progress_mgr.get_last_index(progress_key)
+    previous_chunk_count = existing_manifest_chunk_count(
+        manifest_store,
+        task.collection_name,
+        source_file,
+    )
+
+    if start_idx >= 0 and previous_chunk_count == 0:
+        logger.warning(
+            "Progress exists for %s but manifest is missing. Rebuilding this source from scratch.",
+            source_file,
+        )
+        start_idx = -1
 
     if start_idx == -1:
-        logger.info(f"🧹 首次写入 {Path(file_path).name}，清理历史冗余数据...")
-        vector_db.delete_by_source(collection_name, file_path)
-        keyword_db.delete_by_source(collection_name, file_path)
+        reset_file_state(task, source_file, vector_db, keyword_db)
+        previous_chunk_count = 0
     else:
-        logger.info(f"♻️ 断点触发！文件 {Path(file_path).name} 将从第 {start_idx + 1} 行续传。")
-        
-    chunk_generator = adapter_func(file_path, start_idx)
-    batch_chunks =[]
-    last_row_idx = -1
-    total_inserted = 0
-    pbar = tqdm(desc=f"写入 {Path(file_path).name}", unit="条")
-    
-    for chunk, row_idx in chunk_generator:
-        if SHUTDOWN_REQUESTED: break
+        logger.info(
+            "Resuming %s from record index %s",
+            source_file,
+            start_idx + 1,
+        )
+
+    batch_chunks: List[DocumentChunk] = []
+    last_row_idx = start_idx
+    inserted_chunks = 0
+    progress = tqdm(desc=f"Ingest {task.path.name}", unit="chunk")
+
+    for chunk, row_index in task.adapter(task, start_idx):
+        if SHUTDOWN_REQUESTED:
+            break
 
         batch_chunks.append(chunk)
-        last_row_idx = row_idx
-        
-        if len(batch_chunks) >= batch_size:
-            texts = [c.content for c in batch_chunks]
-            embeddings = embedding_model.embed_documents(texts)
-            
-            vector_db.add_chunks(collection_name, batch_chunks, embeddings)
-            keyword_db.build_index(collection_name, batch_chunks)
-            
-            progress_mgr.save_index(file_path, last_row_idx)
-            total_inserted += len(batch_chunks)
-            pbar.update(len(batch_chunks))
-            batch_chunks =[]
-            
-    if batch_chunks:
-        texts =[c.content for c in batch_chunks]
-        embeddings = embedding_model.embed_documents(texts)
-        vector_db.add_chunks(collection_name, batch_chunks, embeddings)
-        keyword_db.build_index(collection_name, batch_chunks)
-        progress_mgr.save_index(file_path, last_row_idx)
-        total_inserted += len(batch_chunks)
-        pbar.update(len(batch_chunks))
-        
-    pbar.close()
+        last_row_idx = row_index
+        if len(batch_chunks) < batch_size:
+            continue
 
-# ==========================================
-# 🚀 主程序
-# ==========================================
-def main():
-    global SHUTDOWN_REQUESTED
-    logger.info(f"⏳ 初始化单卡高稳定性流水线 (上限: {MAX_SAMPLES_PER_FILE} 条/文件)...")
+        inserted_chunks += flush_batch(
+            task.collection_name,
+            batch_chunks,
+            embedding_model,
+            vector_db,
+            keyword_db,
+        )
+        progress_mgr.save_index(progress_key, last_row_idx)
+        progress.update(len(batch_chunks))
+        batch_chunks = []
+
+    if batch_chunks:
+        inserted_chunks += flush_batch(
+            task.collection_name,
+            batch_chunks,
+            embedding_model,
+            vector_db,
+            keyword_db,
+        )
+        progress_mgr.save_index(progress_key, last_row_idx)
+        progress.update(len(batch_chunks))
+
+    progress.close()
+
+    total_chunk_count = previous_chunk_count + inserted_chunks
+    if start_idx == -1 and not SHUTDOWN_REQUESTED:
+        total_chunk_count = inserted_chunks
+
+    if total_chunk_count > 0:
+        manifest_store.upsert_file(
+            collection_name=task.collection_name,
+            source_file=source_file,
+            chunk_count=total_chunk_count,
+            metadata={
+                "collection_name": task.collection_name,
+                "domain": task.domain,
+                "source_format": task.source_format,
+                "language": task.language,
+                "source_path": source_file,
+                "source_display_name": task.path.name,
+                "schema_version": INGEST_SCHEMA_VERSION,
+            },
+        )
+
+    logger.info(
+        "Completed ingest for %s: inserted=%s total_manifest_chunks=%s",
+        source_file,
+        inserted_chunks,
+        total_chunk_count,
+    )
+
+
+def flush_batch(
+    collection_name: str,
+    chunks: List[DocumentChunk],
+    embedding_model: BGEM3Local,
+    vector_db: ChromaStore,
+    keyword_db: WhooshStore,
+) -> int:
+    if not chunks:
+        return 0
+    texts = [chunk.content for chunk in chunks]
+    embeddings = embedding_model.embed_documents(texts)
+    vector_ok = vector_db.add_chunks(collection_name, chunks, embeddings)
+    keyword_ok = keyword_db.build_index(collection_name, chunks)
+    if not vector_ok or not keyword_ok:
+        raise RuntimeError(
+            f"Batch ingest failed for collection={collection_name} vector_ok={vector_ok} keyword_ok={keyword_ok}"
+        )
+    return len(chunks)
+
+
+def build_tasks() -> List[IngestTask]:
+    sources_dir = PROJECT_ROOT / "data" / "sources"
+    return [
+        IngestTask(
+            collection_name="medical_kb",
+            path=sources_dir / "medical" / "finetune" / "train_zh_0.json",
+            adapter=adapter_medical,
+            domain="medical",
+            source_format="jsonl",
+            language="zh",
+        ),
+        IngestTask(
+            collection_name="legal_kb",
+            path=sources_dir / "DISC-Law-SFT" / "DISC-Law-SFT-Pair-QA-released.jsonl",
+            adapter=adapter_legal,
+            domain="legal",
+            source_format="jsonl",
+            language="zh",
+        ),
+        IngestTask(
+            collection_name="financial_kb",
+            path=sources_dir / "DISC-FIN-SFT" / "data" / "total.json",
+            adapter=adapter_financial,
+            domain="financial",
+            source_format="json",
+            language="zh",
+        ),
+        IngestTask(
+            collection_name="enron_kb",
+            path=sources_dir / "enron_qa_0922" / "data" / "train-00000-of-00002.parquet",
+            adapter=adapter_enron,
+            domain="office",
+            source_format="parquet",
+            language="en",
+        ),
+        IngestTask(
+            collection_name="enron_kb",
+            path=sources_dir / "enron_qa_0922" / "data" / "train-00001-of-00002.parquet",
+            adapter=adapter_enron,
+            domain="office",
+            source_format="parquet",
+            language="en",
+        ),
+    ]
+
+
+def main() -> None:
+    logger.info(
+        "Initializing offline KB build pipeline: max_samples_per_file=%s batch_size=%s",
+        MAX_SAMPLES_PER_FILE,
+        DEFAULT_BATCH_SIZE,
+    )
     embedding_model = BGEM3Local()
     vector_db = ChromaStore()
     keyword_db = WhooshStore()
-    progress_mgr = ProgressManager()
-    
-    sources_dir = Path(project_root) / "data" / "sources"
-    
-    tasks =[
-        {"collection": "medical_kb", "path": sources_dir / "medical" / "finetune" / "train_zh_0.json", "adapter": adapter_medical},
-        {"collection": "legal_kb", "path": sources_dir / "DISC-Law-SFT" / "DISC-Law-SFT-Pair-QA-released.jsonl", "adapter": adapter_legal},
-        {"collection": "financial_kb", "path": sources_dir / "DISC-FIN-SFT" / "data" / "total.json", "adapter": adapter_financial},
-        {"collection": "enron_kb", "path": sources_dir / "enron_qa_0922" / "data" / "train-00000-of-00002.parquet", "adapter": adapter_enron},
-        {"collection": "enron_kb", "path": sources_dir / "enron_qa_0922" / "data" / "train-00001-of-00002.parquet", "adapter": adapter_enron}
-    ]
+    progress_mgr = ProgressManager(settings.INGEST_PROGRESS_PATH)
+    manifest_store = KnowledgeBaseManifestStore(settings.KB_MANIFEST_PATH)
 
-    for task in tasks:
-        if SHUTDOWN_REQUESTED: break
-            
-        logger.info("=" * 60)
-        file_path_str = str(task["path"])
-        if not task["path"].exists():
-            logger.error(f"❌ 数据源不存在，跳过: {file_path_str}")
+    for task in build_tasks():
+        if SHUTDOWN_REQUESTED:
+            break
+        logger.info("=" * 72)
+        if not task.path.exists():
+            logger.error("Source file is missing, skip: %s", task.path)
             continue
-            
         ingest_file_to_db(
-            collection_name=task["collection"],
-            file_path=file_path_str,
-            adapter_func=task["adapter"],
+            task=task,
             embedding_model=embedding_model,
             vector_db=vector_db,
             keyword_db=keyword_db,
             progress_mgr=progress_mgr,
-            batch_size=1024 
+            manifest_store=manifest_store,
+            batch_size=DEFAULT_BATCH_SIZE,
         )
 
     if SHUTDOWN_REQUESTED:
-        logger.info("👋 任务已安全中止！进度已记录，下次运行将自动续传。")
+        logger.info("Offline KB build stopped safely. Progress and manifest were preserved.")
     else:
-        logger.info("🎉 恭喜！单卡极限稳定性流水线完美执行完毕！")
+        logger.info("Offline KB build finished successfully.")
+
 
 if __name__ == "__main__":
     main()

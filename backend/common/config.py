@@ -25,6 +25,7 @@ class Settings(BaseSettings):
     CONVERSATION_DB_PATH: str = Field(default=str(PROJECT_ROOT / "data" / "application_db" / "conversations.db"))
     USER_PROFILE_DB_PATH: str = Field(default=str(PROJECT_ROOT / "data" / "application_db" / "user_profiles.db"))
     INGEST_PROGRESS_PATH: str = Field(default=str(PROJECT_ROOT / "data" / "application_db" / "ingest_progress.json"))
+    KB_MANIFEST_PATH: str = Field(default=str(PROJECT_ROOT / "data" / "application_db" / "knowledge_base_manifest.json"))
     VECTOR_HEALTH_REPORT_PATH: str = Field(default=str(PROJECT_ROOT / "data" / "application_db" / "vector_index_doctor_report.json"))
     
     # ===[检索配置] ===
@@ -48,6 +49,7 @@ class Settings(BaseSettings):
         "CONVERSATION_DB_PATH", 
         "USER_PROFILE_DB_PATH", 
         "INGEST_PROGRESS_PATH",
+        "KB_MANIFEST_PATH",
         "VECTOR_HEALTH_REPORT_PATH",
         mode="after"
     )

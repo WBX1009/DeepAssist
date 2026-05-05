@@ -7,6 +7,7 @@ from backend.domain.entities.intent import IntentDecision
 
 
 class AgentWorkerType(str, Enum):
+    ORCHESTRATOR = "orchestrator_worker"
     CHAT = "chat_worker"
     RAG = "rag_worker"
     TOOL = "tool_agent_worker"

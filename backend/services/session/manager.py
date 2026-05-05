@@ -1,71 +1,100 @@
-from typing import List, Dict, Any
+from typing import Any, Dict, List
+
 from backend.common.event_bus import event_bus
+from backend.common.logger import get_logger
+from backend.domain.entities.context_window import ContextWindowPlan
+from backend.domain.entities.message import AIMessage, Message
+from backend.domain.entities.task_snapshot import TaskSnapshot
 from backend.domain.entities.tooling import ToolCall
 from backend.domain.interfaces.memory_db import BaseMemoryStore
-from backend.domain.entities.message import Message, AIMessage
-from backend.common.logger import get_logger
+from backend.services.session.context_window_manager import PriorityContextWindowManager
+from backend.services.session.long_term_memory_recall import LongTermMemoryRecallService
+from backend.services.session.summary_compressor import ConversationSummaryCompressor
 
 logger = get_logger(__name__)
 
+
 class SessionManager:
-    """会话上下文管家"""
-    def __init__(self, memory_store: BaseMemoryStore):
+    """Conversation history orchestration for persistence and context windows."""
+
+    def __init__(
+        self,
+        memory_store: BaseMemoryStore,
+        context_window_manager: PriorityContextWindowManager | None = None,
+        summary_compressor: ConversationSummaryCompressor | None = None,
+        memory_recall: LongTermMemoryRecallService | None = None,
+    ):
         self.store = memory_store
+        self.context_window_manager = context_window_manager or PriorityContextWindowManager()
+        self.summary_compressor = summary_compressor or ConversationSummaryCompressor()
+        self.memory_recall = memory_recall or LongTermMemoryRecallService(memory_store)
 
-    def get_chat_context(self, session_id: str, max_rounds: int = 5) -> List[Dict[str, Any]]:
-        history_entities = self.store.get_history(session_id, limit=max_rounds)
-        raw_messages =[msg.model_dump(exclude_none=True) for msg in history_entities]
-        raw_messages = [self._normalize_message_for_llm(msg) for msg in raw_messages]
+    def get_session_history(self, session_id: str, limit: int = 50) -> List[Dict[str, Any]]:
+        raw_messages = self._load_and_normalize_history(session_id, limit=max(1, limit))
+        return self._sanitize_tool_history(raw_messages)
 
-        # ==========================================
-        # 🛡️ 终极防御：基于状态机的严格历史清洗算法
-        # 确保 OpenAI 接收到的上下文 100% 遵守 tool_calls 协议
-        # ==========================================
-        valid_messages =[]
-        expected_tool_call_ids = set()
+    def plan_chat_context(
+        self,
+        session_id: str,
+        max_rounds: int = 5,
+        query: str = "",
+        use_long_term_memory: bool = False,
+    ) -> ContextWindowPlan:
+        safe_budget = max(1, max_rounds)
+        persisted_summary = self.store.get_session_summary(session_id)
+        recalled_memories = (
+            self._recall_long_term_memories(query, safe_budget)
+            if use_long_term_memory
+            else []
+        )
+        history_budget = max(1, safe_budget - len(recalled_memories))
 
-        for msg in raw_messages:
-            role = msg.get("role")
+        raw_history = self._load_and_normalize_history(
+            session_id,
+            limit=max(history_budget * 3, safe_budget),
+        )
+        valid_messages = self._sanitize_tool_history(raw_history)
+        plan = self.context_window_manager.plan(valid_messages, budget=history_budget)
+        if plan.dropped_turns:
+            summary = self.summary_compressor.compress(plan.dropped_turns)
+            if summary is not None:
+                persisted_copy = summary.model_copy(update={"source": "persisted"})
+                self.store.save_session_summary(session_id, persisted_copy)
+                plan = plan.model_copy(update={"summary": summary})
+        elif persisted_summary is not None:
+            plan = plan.model_copy(
+                update={"summary": persisted_summary.model_copy(update={"source": "persisted"})}
+            )
+        if recalled_memories:
+            plan = plan.model_copy(update={"recalled_memories": recalled_memories, "budget": safe_budget})
+        else:
+            plan = plan.model_copy(update={"budget": safe_budget})
+        return plan
 
-            if role in ["user", "system"]:
-                # 出现用户消息，说明前一轮结束。若此时还有未闭合的 tool_call，说明是残缺的崩溃轮次，直接回滚丢弃！
-                if expected_tool_call_ids:
-                    while valid_messages and (valid_messages[-1].get("role") == "tool" or "tool_calls" in valid_messages[-1]):
-                        valid_messages.pop()
-                    expected_tool_call_ids.clear()
-                valid_messages.append(msg)
-
-            elif role == "assistant":
-                if expected_tool_call_ids:
-                    # 发现连续的 assistant 且上一次的 tool 没返回，回滚上一个异常链
-                    while valid_messages and (valid_messages[-1].get("role") == "tool" or "tool_calls" in valid_messages[-1]):
-                        valid_messages.pop()
-                    expected_tool_call_ids.clear()
-
-                valid_messages.append(msg)
-                # 记录这句 assistant 发起了哪些工具调用
-                if "tool_calls" in msg and msg["tool_calls"]:
-                    expected_tool_call_ids = {tc["id"] for tc in msg["tool_calls"]}
-
-            elif role == "tool":
-                # 如果当前根本没在等工具返回（孤儿工具结果），直接丢弃
-                if not expected_tool_call_ids:
-                    continue
-
-                tool_id = msg.get("tool_call_id")
-                # 如果这个工具是期望中的一个，保留它并从等待清单划掉
-                if tool_id in expected_tool_call_ids:
-                    valid_messages.append(msg)
-                    expected_tool_call_ids.remove(tool_id)
-                else:
-                    continue # 乱入的无效工具结果，丢弃
-
-        # 尾部兜底：如果整个历史记录的最后一条是残缺的工具调用，回滚删除它，防止污染接下来的提问
-        if expected_tool_call_ids:
-             while valid_messages and (valid_messages[-1].get("role") == "tool" or "tool_calls" in valid_messages[-1]):
-                 valid_messages.pop()
-
-        return valid_messages
+    def get_chat_context(
+        self,
+        session_id: str,
+        max_rounds: int = 5,
+        query: str = "",
+        use_long_term_memory: bool = False,
+    ) -> List[Dict[str, Any]]:
+        plan = self.plan_chat_context(
+            session_id,
+            max_rounds=max_rounds,
+            query=query,
+            use_long_term_memory=use_long_term_memory,
+        )
+        messages = plan.flattened_messages()
+        logger.debug(
+            "Context window selected %s messages for session %s under budget=%s; recalled_memories=%s, dropped_turns=%s, summary=%s",
+            len(messages),
+            session_id,
+            plan.budget,
+            len(plan.recalled_memories),
+            len(plan.dropped_turns),
+            bool(plan.summary),
+        )
+        return messages
 
     def save_interaction(self, session_id: str, user_query: str, ai_response: str):
         messages: List[Dict[str, Any]] = []
@@ -87,9 +116,7 @@ class SessionManager:
             )
 
     def add_messages(self, session_id: str, messages: List[Dict[str, Any]]):
-        """将 engine 返回的 Dict 转换为强类型 Message 并入库"""
         for msg in messages:
-            # 动态判断是普通消息还是携带 tool_calls 的复杂消息
             if "tool_calls" in msg and msg["tool_calls"]:
                 entity = AIMessage(**msg)
             else:
@@ -104,26 +131,96 @@ class SessionManager:
                     "messages": messages,
                 },
             )
-            
-        logger.info(f"✅ 已持久化 {len(messages)} 条对话及工具调用轨迹至数据库。")
+
+        logger.info("Persisted %s conversation/tool trace messages", len(messages))
 
     def delete_session(self, session_id: str) -> bool:
-        """
-        生命周期管理：销毁整个会话及其所有关联轨迹
-        """
         success = self.store.clear_history(session_id)
         if success:
-            logger.info(f"🗑️[Lifecycle] 会话 {session_id} 及其所有对话轨迹已被永久销毁。")
+            self.store.clear_task_snapshot(session_id)
+            self.store.clear_session_summary(session_id)
+            logger.info("Deleted session lifecycle for %s", session_id)
         return success
 
     def list_sessions(self) -> List[Dict[str, Any]]:
         return self.store.get_all_sessions()
 
+    def get_task_snapshot(self, session_id: str) -> TaskSnapshot | None:
+        return self.store.get_task_snapshot(session_id)
+
+    def save_task_snapshot(self, snapshot: TaskSnapshot) -> bool:
+        return self.store.save_task_snapshot(snapshot)
+
+    def clear_task_snapshot(self, session_id: str) -> bool:
+        return self.store.clear_task_snapshot(session_id)
+
+    def _load_and_normalize_history(self, session_id: str, limit: int) -> List[Dict[str, Any]]:
+        history_entities = self.store.get_history(session_id, limit=limit)
+        raw_messages = [msg.model_dump(exclude_none=True) for msg in history_entities]
+        return [self._normalize_message_for_llm(msg) for msg in raw_messages]
+
+    def _sanitize_tool_history(self, raw_messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        valid_messages: List[Dict[str, Any]] = []
+        expected_tool_call_ids = set()
+
+        for msg in raw_messages:
+            role = msg.get("role")
+
+            if role in {"user", "system"}:
+                if expected_tool_call_ids:
+                    while valid_messages and (
+                        valid_messages[-1].get("role") == "tool"
+                        or "tool_calls" in valid_messages[-1]
+                    ):
+                        valid_messages.pop()
+                    expected_tool_call_ids.clear()
+                valid_messages.append(msg)
+                continue
+
+            if role == "assistant":
+                if expected_tool_call_ids:
+                    while valid_messages and (
+                        valid_messages[-1].get("role") == "tool"
+                        or "tool_calls" in valid_messages[-1]
+                    ):
+                        valid_messages.pop()
+                    expected_tool_call_ids.clear()
+
+                valid_messages.append(msg)
+                if "tool_calls" in msg and msg["tool_calls"]:
+                    expected_tool_call_ids = {tc["id"] for tc in msg["tool_calls"]}
+                continue
+
+            if role == "tool":
+                if not expected_tool_call_ids:
+                    continue
+
+                tool_id = msg.get("tool_call_id")
+                if tool_id in expected_tool_call_ids:
+                    valid_messages.append(msg)
+                    expected_tool_call_ids.remove(tool_id)
+
+        if expected_tool_call_ids:
+            while valid_messages and (
+                valid_messages[-1].get("role") == "tool"
+                or "tool_calls" in valid_messages[-1]
+            ):
+                valid_messages.pop()
+
+        return valid_messages
+
     def _normalize_message_for_llm(self, msg: Dict[str, Any]) -> Dict[str, Any]:
         if msg.get("role") == "assistant" and msg.get("tool_calls"):
-            msg = dict(msg)
-            msg["tool_calls"] = [
+            normalized = dict(msg)
+            normalized["tool_calls"] = [
                 ToolCall.model_validate(tool_call).to_openai_tool_call()
                 for tool_call in msg["tool_calls"]
             ]
+            return normalized
         return msg
+
+    def _recall_long_term_memories(self, query: str, budget: int):
+        if not query.strip() or budget <= 1:
+            return []
+        memory_limit = min(2, max(1, budget // 3))
+        return self.memory_recall.recall(query, max_items=memory_limit)

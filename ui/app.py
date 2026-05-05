@@ -53,25 +53,25 @@ st.markdown(
 
 MODES = {
     "agent": {
-        "title": "智能对话",
-        "desc": "复杂任务智能体，支持工具调用、路由与自修正",
+        "title": "Agent",
+        "desc": "Multi-step assistant with supervisor routing, tools, recovery, and trace visibility.",
         "icon": "AI",
         "color": "#9b7cff",
-        "welcome": "已进入智能对话模式。我会根据任务自动路由到聊天、RAG 或工具智能体。",
+        "welcome": "Agent mode is active. I will route the task across chat, knowledge retrieval, and tools when needed.",
     },
     "rag": {
-        "title": "知识问答",
-        "desc": "显式调用知识库链路，输出引用与检索轨迹",
+        "title": "Knowledge Q&A",
+        "desc": "Source-grounded retrieval over the offline knowledge-base collections with diagnostics and citations.",
         "icon": "RAG",
         "color": "#1ed6a5",
-        "welcome": "已进入知识问答模式。我会使用后端知识库检索、重排、引用打包和答案守卫。",
+        "welcome": "Knowledge Q&A mode is active. I will retrieve from the connected offline KB, pack citations, and apply grounding checks.",
     },
     "quick": {
-        "title": "快速开始",
-        "desc": "纯 LLM 对话，适合日常问答和轻量生成",
+        "title": "Fast Chat",
+        "desc": "Pure LLM conversation for everyday questions, ideation, and lightweight drafting.",
         "icon": "LLM",
         "color": "#ff725f",
-        "welcome": "已进入快速开始模式。这里不会显式调用知识库或工具链路。",
+        "welcome": "Fast Chat mode is active. I will answer directly without forcing KB retrieval or tool execution.",
     },
 }
 
@@ -83,18 +83,24 @@ def init_state() -> None:
         "chat_mode": "quick",
         "messages": [],
         "show_home": True,
-        "selected_model": "DeepSeek Chat",
+        "selected_model": "deepseek-chat",
         "temperature": 0.7,
         "top_p": 1.0,
         "history_rounds": 10,
         "use_user_memory": False,
-        "rrf_weight": 1.0,
         "show_settings": False,
         "kb_collection": DEFAULT_COLLECTION,
+        "rag_collection_scope": RAG_COLLECTION,
         "kb_confirm_delete_all": False,
+        "runtime_capabilities": {},
     }
     for key, value in defaults.items():
         st.session_state.setdefault(key, value)
+    st.session_state.selected_model = {
+        "DeepSeek Chat": "deepseek-chat",
+        "DeepSeek Reasoner": "deepseek-reasoner",
+        "智谱 GLM-4.6": "deepseek-chat",
+    }.get(str(st.session_state.selected_model), str(st.session_state.selected_model))
 
 
 def api_url(path: str) -> str:
@@ -151,6 +157,10 @@ def fetch_kb_health(refresh: bool = False) -> Dict[str, Any]:
         "/kb/health",
         params={"refresh": refresh},
     )
+
+
+def fetch_runtime_capabilities() -> Dict[str, Any]:
+    return request_json("GET", "/runtime/capabilities")
 
 
 def delete_kb_file(source_file: str, collection_name: Optional[str] = None) -> Dict[str, Any]:
@@ -230,12 +240,84 @@ def mode_label(mode: str) -> str:
 
 
 def backend_model_name() -> str:
-    selected = st.session_state.get("selected_model", "DeepSeek Chat")
-    if selected == "DeepSeek Reasoner":
-        return "deepseek-reasoner"
-    if selected == "DeepSeek Chat":
-        return "deepseek-chat"
-    return "deepseek-chat"
+    selected = str(st.session_state.get("selected_model", "deepseek-chat"))
+    legacy_map = {
+        "DeepSeek Chat": "deepseek-chat",
+        "DeepSeek Reasoner": "deepseek-reasoner",
+        "智谱 GLM-4.6": "deepseek-chat",
+    }
+    return legacy_map.get(selected, selected or "deepseek-chat")
+
+
+def get_runtime_capabilities(refresh: bool = False) -> Dict[str, Any]:
+    cached = st.session_state.get("runtime_capabilities")
+    if refresh or not isinstance(cached, dict) or not cached:
+        payload = fetch_runtime_capabilities()
+        data = payload.get("data", {})
+        st.session_state.runtime_capabilities = data if isinstance(data, dict) else {}
+    return st.session_state.get("runtime_capabilities", {})
+
+
+def runtime_models() -> List[Dict[str, Any]]:
+    models = get_runtime_capabilities().get("models", [])
+    if isinstance(models, list) and models:
+        return [item for item in models if isinstance(item, dict) and item.get("id")]
+    return [
+        {"id": "deepseek-chat", "label": "DeepSeek Chat", "supported": True},
+        {"id": "deepseek-reasoner", "label": "DeepSeek Reasoner", "supported": True},
+    ]
+
+
+def runtime_tools() -> List[Dict[str, Any]]:
+    tools = get_runtime_capabilities().get("tools", [])
+    return tools if isinstance(tools, list) else []
+
+
+def runtime_mode_specs() -> Dict[str, Dict[str, Any]]:
+    items = get_runtime_capabilities().get("modes", [])
+    if not isinstance(items, list):
+        return {}
+    return {
+        str(item.get("id")): item
+        for item in items
+        if isinstance(item, dict) and item.get("id")
+    }
+
+
+def runtime_kb_scope_options() -> List[Dict[str, Any]]:
+    kb = get_runtime_capabilities().get("knowledge_base", {})
+    if not isinstance(kb, dict):
+        return []
+    options = kb.get("rag_scope_options", [])
+    return options if isinstance(options, list) else []
+
+
+def selected_model_label() -> str:
+    current = backend_model_name()
+    for item in runtime_models():
+        if item.get("id") == current:
+            return str(item.get("label") or current)
+    return current
+
+
+def current_rag_scope() -> str:
+    scope = str(st.session_state.get("rag_collection_scope", RAG_COLLECTION) or RAG_COLLECTION)
+    options = {
+        str(item.get("id"))
+        for item in runtime_kb_scope_options()
+        if isinstance(item, dict) and item.get("id")
+    }
+    if options and scope not in options:
+        return RAG_COLLECTION
+    return scope
+
+
+def current_rag_scope_label() -> str:
+    scope = current_rag_scope()
+    for item in runtime_kb_scope_options():
+        if isinstance(item, dict) and item.get("id") == scope:
+            return str(item.get("label") or scope)
+    return scope
 
 
 def runtime_payload() -> Dict[str, Any]:
@@ -245,6 +327,31 @@ def runtime_payload() -> Dict[str, Any]:
         "top_p": float(st.session_state.top_p),
         "history_rounds": int(st.session_state.history_rounds),
         "use_user_memory": bool(st.session_state.use_user_memory),
+    }
+
+
+def request_contract_preview(prompt: str = "<user query>") -> Dict[str, Any]:
+    if st.session_state.chat_mode == "agent":
+        return {
+            "endpoint": "/api/agent/stream",
+            "payload": {
+                "session_id": st.session_state.session_id,
+                "query": prompt,
+                **runtime_payload(),
+            },
+        }
+
+    return {
+        "endpoint": "/api/chat/stream",
+        "payload": {
+            "session_id": st.session_state.session_id,
+            "query": prompt,
+            "mode": st.session_state.chat_mode,
+            "collection_name": current_rag_scope()
+            if st.session_state.chat_mode == "rag"
+            else DEFAULT_COLLECTION,
+            **runtime_payload(),
+        },
     }
 
 
@@ -266,7 +373,7 @@ def render_sidebar() -> None:
         st.divider()
 
         tab_cols = st.columns(3)
-        tabs = [("assistant", "智能体助手"), ("history", "聊天记录"), ("kb", "知识库")]
+        tabs = [("assistant", "Assistant"), ("history", "History"), ("kb", "Knowledge Base")]
         for col, (key, label) in zip(tab_cols, tabs):
             if col.button(
                 label,
@@ -279,7 +386,7 @@ def render_sidebar() -> None:
         st.divider()
 
         if st.session_state.nav_tab in {"assistant", "history"}:
-            if st.button("新聊天", use_container_width=True, type="primary"):
+            if st.button("New chat", use_container_width=True, type="primary"):
                 create_new_chat()
                 st.rerun()
 
@@ -288,28 +395,81 @@ def render_sidebar() -> None:
         elif st.session_state.nav_tab == "history":
             render_sidebar_history()
         else:
-            render_sidebar_kb()
+            render_sidebar_kb_v2()
 
 
 def render_sidebar_agent_controls() -> None:
-    st.caption("当前驱动模型")
+    model_items = runtime_models()
+    model_ids = [str(item.get("id")) for item in model_items]
+    current = backend_model_name()
+    if current not in model_ids and model_ids:
+        st.session_state.selected_model = model_ids[0]
+
+    st.caption("Runtime model")
     st.selectbox(
-        "选择模型",
-        ["DeepSeek Chat", "DeepSeek Reasoner", "智谱 GLM-4.6"],
+        "Select model",
+        model_ids,
         key="selected_model",
+        format_func=lambda model_id: next(
+            (
+                str(item.get("label"))
+                for item in model_items
+                if item.get("id") == model_id
+            ),
+            model_id,
+        ),
         label_visibility="collapsed",
     )
-    if st.session_state.selected_model.startswith("智谱"):
-        st.caption("智谱模型入口已预留，当前后端仍使用 DeepSeek 适配器。")
 
-    with st.expander("智能体参数", expanded=True):
+    selected_meta = next(
+        (item for item in model_items if item.get("id") == backend_model_name()),
+        {},
+    )
+    selected_note = str(selected_meta.get("notes") or "").strip()
+    if selected_note:
+        st.caption(selected_note)
+
+    with st.expander("Request settings", expanded=True):
         st.slider("Temperature", 0.0, 2.0, key="temperature", step=0.1)
         st.slider("Top P", 0.0, 1.0, key="top_p", step=0.05)
-        st.slider("历史窗口", 1, 30, key="history_rounds")
-        st.checkbox("启用长期记忆画像", key="use_user_memory")
+        st.slider("History rounds", 1, 30, key="history_rounds")
+        st.checkbox("Enable long-term profile memory", key="use_user_memory")
+        if st.session_state.chat_mode == "rag":
+            scope_options = runtime_kb_scope_options()
+            scope_ids = [str(item.get("id")) for item in scope_options if isinstance(item, dict)]
+            if scope_ids:
+                if current_rag_scope() not in scope_ids:
+                    st.session_state.rag_collection_scope = scope_ids[0]
+                st.selectbox(
+                    "RAG scope",
+                    scope_ids,
+                    key="rag_collection_scope",
+                    format_func=lambda scope_id: next(
+                        (
+                            str(item.get("label"))
+                            for item in scope_options
+                            if item.get("id") == scope_id
+                        ),
+                        scope_id,
+                    ),
+                )
+                st.caption("Knowledge Q&A mode can search all collections or a single selected collection.")
+        elif st.session_state.chat_mode == "agent":
+            st.caption("Agent mode always searches across all connected knowledge-base collections when retrieval is needed.")
 
-    with st.expander("可用工具", expanded=False):
-        st.markdown("- Python 沙箱\n- 只读 SQL 探查\n- 本地文件读写\n- 天气查询\n- 知识库检索")
+    with st.expander("Registered tools", expanded=False):
+        tools = runtime_tools()
+        if not tools:
+            st.info("No tool metadata is available from the backend right now.")
+        else:
+            for tool in tools:
+                name = str(tool.get("name") or "tool")
+                description = str(tool.get("description") or "")
+                args = tool.get("parameters", []) or []
+                required = [str(item.get("name")) for item in args if item.get("required")]
+                required_text = ", ".join(required) if required else "none"
+                st.markdown(f"- `{name}`")
+                st.caption(f"{description} | required args: {required_text}")
 
 
 def render_sidebar_history() -> None:
@@ -326,7 +486,7 @@ def render_sidebar_history() -> None:
         if cols[0].button(title, key=f"open_{session_id}", use_container_width=True):
             load_session(session_id)
             st.rerun()
-        if cols[1].button("删", key=f"delete_{session_id}", use_container_width=True):
+        if cols[1].button("Del", key=f"delete_{session_id}", use_container_width=True):
             result = delete_session(session_id)
             if result.get("status") == "success":
                 if st.session_state.session_id == session_id:
@@ -381,11 +541,92 @@ def render_sidebar_kb() -> None:
         st.info("多知识库命名空间入口已预留；当前可管理已有集合和默认 tech_docs_kb。")
 
 
+def render_sidebar_kb_v2() -> None:
+    collections_payload = fetch_kb_collections()
+    health_payload = fetch_kb_health(refresh=False)
+
+    collections = collections_payload.get("data", [])
+    collections = collections if isinstance(collections, list) else []
+    health_report = health_payload.get("data", {})
+    health_report = health_report if isinstance(health_report, dict) else {}
+    health_collections = health_report.get("collections", [])
+    health_collections = health_collections if isinstance(health_collections, list) else []
+
+    collection_names = [
+        item.get("collection_name")
+        for item in collections
+        if isinstance(item, dict) and item.get("collection_name")
+    ]
+    if st.session_state.kb_collection not in collection_names and collection_names:
+        st.session_state.kb_collection = collection_names[0]
+
+    st.caption("Knowledge Base")
+    if collection_names:
+        st.selectbox(
+            "Current collection",
+            collection_names,
+            key="kb_collection",
+            label_visibility="collapsed",
+        )
+
+    selected = st.session_state.kb_collection
+    selected_meta = next(
+        (item for item in collections if item.get("collection_name") == selected),
+        {},
+    )
+    selected_health = next(
+        (item for item in health_collections if item.get("collection_name") == selected),
+        {},
+    )
+
+    stores = " + ".join(selected_meta.get("stores", [])) or "Unavailable"
+    file_count = int(selected_meta.get("file_count", 0))
+    chunk_count = int(selected_meta.get("chunk_count", 0))
+    health_status = "Healthy" if selected_health.get("healthy") else "Needs attention"
+    checked_at = health_report.get("checked_at", "--")
+    errors = selected_health.get("errors", []) or []
+
+    st.markdown(
+        f"""
+<div class="panel">
+  <div style="font-weight:800;">{selected or "No collection selected"}</div>
+  <div class="tiny">{file_count} files, {chunk_count} chunks</div>
+  <div style="margin-top:.45rem;">
+    <span class="metric-pill">{stores}</span>
+    <span class="metric-pill">Health: {health_status}</span>
+  </div>
+  <div class="tiny" style="margin-top:.45rem;">Checked: {checked_at}</div>
+  <div class="tiny">Health issues: {len(errors)}</div>
+  <div class="tiny">Current Knowledge Q&A scope: {current_rag_scope_label()}</div>
+</div>
+""",
+        unsafe_allow_html=True,
+    )
+
+    refresh_disabled = not bool(collection_names)
+    if st.button("Refresh KB health", use_container_width=True, disabled=refresh_disabled):
+        refreshed = fetch_kb_health(refresh=True)
+        if refreshed.get("status") in {"success", "partial_success"}:
+            st.success("Knowledge-base health report updated.")
+        else:
+            st.error(refreshed.get("message", "Knowledge-base health refresh failed."))
+        st.rerun()
+
+    with st.expander("Health details", expanded=False):
+        st.caption("RAG and Agent retrieval search across all collections by default.")
+        if selected_health:
+            st.json(selected_health)
+        elif collection_names:
+            st.info("No cached health data for the selected collection yet.")
+        else:
+            st.info("No knowledge-base collections found.")
+
+
 def render_home() -> None:
     st.markdown('<div style="height: 10vh;"></div>', unsafe_allow_html=True)
-    st.markdown('<p class="page-title" style="text-align:center;">开始新的对话</p>', unsafe_allow_html=True)
+    st.markdown('<p class="page-title" style="text-align:center;">Start a New Session</p>', unsafe_allow_html=True)
     st.markdown(
-        '<p class="page-subtitle" style="text-align:center;">选择一个工作模式，或直接在底部输入消息创建新会话</p>',
+        '<p class="page-subtitle" style="text-align:center;">Pick a mode below, or type directly in the chat box to start working.</p>',
         unsafe_allow_html=True,
     )
     st.markdown('<div style="height: 1.6rem;"></div>', unsafe_allow_html=True)
@@ -409,7 +650,7 @@ def render_home() -> None:
                 unsafe_allow_html=True,
             )
             cols = st.columns([0.7, 0.3])
-            if cols[1].button(f"进入{spec['title']}", key=f"enter_{mode}", use_container_width=True):
+            if cols[1].button(f"Enter {spec['title']}", key=f"enter_{mode}", use_container_width=True):
                 enter_mode(mode)
                 st.rerun()
             st.write("")
@@ -418,6 +659,11 @@ def render_home() -> None:
 def render_chat_header() -> None:
     spec = MODES.get(st.session_state.chat_mode, MODES["quick"])
     cols = st.columns([0.62, 0.38])
+    scope_badge = ""
+    if st.session_state.chat_mode == "rag":
+        scope_badge = f'<span class="metric-pill">KB Scope: {current_rag_scope_label()}</span>'
+    elif st.session_state.chat_mode == "agent":
+        scope_badge = '<span class="metric-pill">KB Scope: all connected collections</span>'
     with cols[0]:
         st.markdown(
             f"""
@@ -426,7 +672,8 @@ def render_chat_header() -> None:
   <div class="muted">{spec['desc']}</div>
   <div style="margin-top:.55rem;">
     <span class="metric-pill">Session: {st.session_state.session_id}</span>
-    <span class="metric-pill">Model: {st.session_state.selected_model}</span>
+    <span class="metric-pill">Model: {selected_model_label()}</span>
+    {scope_badge}
   </div>
 </div>
 """,
@@ -434,12 +681,12 @@ def render_chat_header() -> None:
         )
     with cols[1]:
         button_cols = st.columns(3)
-        if button_cols[0].button("参数", use_container_width=True):
+        if button_cols[0].button("Settings", use_container_width=True):
             st.session_state.show_settings = not st.session_state.show_settings
-        if button_cols[1].button("切换模式", use_container_width=True):
+        if button_cols[1].button("Switch mode", use_container_width=True):
             st.session_state.show_home = True
             st.rerun()
-        if button_cols[2].button("新聊天", use_container_width=True, type="primary"):
+        if button_cols[2].button("New chat", use_container_width=True, type="primary"):
             create_new_chat()
             st.rerun()
 
@@ -449,25 +696,61 @@ def render_chat_header() -> None:
 
 def render_settings_panel() -> None:
     with st.container(border=True):
-        st.markdown("#### 智能体助手设置")
-        left, right = st.columns([0.35, 0.65])
+        st.markdown("#### Runtime Contract")
+        st.caption("These controls now map directly to the backend request payload for the active mode.")
+
+        left, right = st.columns([0.48, 0.52])
         with left:
-            st.radio(
-                "设置分组",
-                ["基础设置", "模型设置", "知识库设置", "工具调用"],
-                label_visibility="collapsed",
-            )
+            mode_specs = runtime_mode_specs()
+            mode_meta = mode_specs.get(st.session_state.chat_mode, {})
+            st.markdown(f"**Mode**: `{st.session_state.chat_mode}`")
+            if mode_meta:
+                st.caption(str(mode_meta.get("description") or ""))
+                st.code(str(mode_meta.get("endpoint") or "n/a"), language="text")
+
+            request_preview = request_contract_preview()
+            st.markdown("**Request preview**")
+            st.json(request_preview)
+
         with right:
+            model_items = runtime_models()
+            model_ids = [str(item.get("id")) for item in model_items]
             st.selectbox(
-                "选择模型",
-                ["DeepSeek Chat", "DeepSeek Reasoner", "智谱 GLM-4.6"],
+                "Model",
+                model_ids,
                 key="selected_model",
+                format_func=lambda model_id: next(
+                    (
+                        str(item.get("label"))
+                        for item in model_items
+                        if item.get("id") == model_id
+                    ),
+                    model_id,
+                ),
             )
             st.slider("Temperature", 0.0, 2.0, key="temperature", step=0.1)
             st.slider("Top P", 0.0, 1.0, key="top_p", step=0.05)
-            st.slider("消息窗口长度", 1, 30, key="history_rounds")
-            st.checkbox("启用长期记忆画像", key="use_user_memory")
-            st.caption("这些参数会随每次请求透传给后端；智谱模型入口为预留位，当前会回退到 DeepSeek 适配器。")
+            st.slider("History rounds", 1, 30, key="history_rounds")
+            st.checkbox("Enable long-term profile memory", key="use_user_memory")
+            if st.session_state.chat_mode == "rag":
+                scope_options = runtime_kb_scope_options()
+                scope_ids = [str(item.get("id")) for item in scope_options if isinstance(item, dict)]
+                if scope_ids:
+                    st.selectbox(
+                        "Knowledge-base scope",
+                        scope_ids,
+                        key="rag_collection_scope",
+                        format_func=lambda scope_id: next(
+                            (
+                                str(item.get("label"))
+                                for item in scope_options
+                                if item.get("id") == scope_id
+                            ),
+                            scope_id,
+                        ),
+                    )
+            else:
+                st.caption("Knowledge-base scope is only configurable in Knowledge Q&A mode.")
 
 
 def render_message(message: Dict[str, Any]) -> None:
@@ -479,14 +762,14 @@ def render_message(message: Dict[str, Any]) -> None:
             st.markdown(content or "")
             events = message.get("events") or []
             if events:
-                render_event_trace(events)
+                render_event_trace_v2(events)
             tool_calls = message.get("tool_calls")
             if tool_calls:
-                with st.expander("工具调用请求", expanded=False):
+                with st.expander("Tool call request", expanded=False):
                     st.json(tool_calls)
     elif role == "tool":
         with st.chat_message("assistant"):
-            with st.expander(f"工具结果：{message.get('name') or 'tool'}", expanded=False):
+            with st.expander(f"Tool result: {message.get('name') or 'tool'}", expanded=False):
                 st.markdown(content or "")
 
 
@@ -551,23 +834,186 @@ def compact_event_summary(events: List[Dict[str, Any]]) -> str:
     return " -> ".join(parts)
 
 
+def render_event_trace_v2(events: List[Dict[str, Any]]) -> None:
+    with st.expander("Runtime Trace", expanded=False):
+        for event in events:
+            event_name = event.get("event")
+            data = event.get("data", {}) or {}
+            if event_name == "supervisor_route":
+                st.markdown(
+                    f"- Route: `{data.get('worker_kind') or data.get('worker')}` "
+                    f"intent=`{data.get('intent')}` confidence=`{data.get('confidence')}`"
+                )
+            elif event_name == "context_window_trace":
+                st.markdown(
+                    f"- Context window: budget=`{data.get('budget', 0)}` "
+                    f"selected_turns=`{data.get('selected_turn_count', 0)}` "
+                    f"dropped_turns=`{data.get('dropped_turn_count', 0)}` "
+                    f"memories=`{data.get('recalled_memory_count', 0)}`"
+                )
+                recalled_memories = data.get("recalled_memories", []) or []
+                if recalled_memories:
+                    st.markdown("Memory recall")
+                    for memory in recalled_memories:
+                        st.markdown(
+                            f"- [{memory.get('category', 'memory')}] {memory.get('content', '')}"
+                        )
+                selected_turns = data.get("selected_turns", []) or []
+                if selected_turns:
+                    st.markdown("Selected turns")
+                    for turn in selected_turns[:4]:
+                        st.markdown(
+                            f"- `{turn.get('turn_id')}` `{turn.get('priority_band')}` "
+                            f"score=`{turn.get('priority_score')}` {turn.get('preview', '')}"
+                        )
+                dropped_turns = data.get("dropped_turns", []) or []
+                if dropped_turns:
+                    st.markdown("Dropped turns")
+                    for turn in dropped_turns[:3]:
+                        st.markdown(
+                            f"- `{turn.get('turn_id')}` `{turn.get('priority_band')}` "
+                            f"{turn.get('preview', '')}"
+                        )
+                summary = data.get("summary")
+                if isinstance(summary, dict):
+                    st.markdown(
+                        f"- Summary injected: dropped_messages=`{summary.get('dropped_message_count', 0)}` "
+                        f"dropped_turns=`{summary.get('dropped_turn_count', 0)}`"
+                    )
+            elif event_name == "multi_agent_plan":
+                st.markdown(
+                    f"- Multi-agent plan: tasks=`{data.get('task_count', 0)}` "
+                    f"mode=`{data.get('mode', 'sequential_collaboration')}` "
+                    f"complexity=`{data.get('complexity', 'medium')}`"
+                )
+                for task in (data.get("tasks", []) or [])[:4]:
+                    st.caption(
+                        f"{task.get('task_id')} -> {task.get('worker')} | {task.get('title')}"
+                    )
+            elif event_name == "collaborator_trace":
+                st.markdown(
+                    f"- Collaborator: phase=`{data.get('phase', 'unknown')}` "
+                    f"worker=`{data.get('worker', 'unknown')}` "
+                    f"task=`{data.get('task_id', '')}`"
+                )
+                if data.get("output_preview"):
+                    st.caption(data.get("output_preview"))
+            elif event_name == "task_recovery":
+                st.markdown(
+                    f"- Task recovery: worker=`{data.get('route_worker', 'unknown')}` "
+                    f"status=`{data.get('status', 'running')}`"
+                )
+                if data.get("payload_keys"):
+                    st.caption(f"Recovered snapshot keys: {data.get('payload_keys')}")
+            elif event_name == "retrieval_trace":
+                st.markdown(
+                    f"- Retrieval: hits=`{data.get('hit_count', 0)}` "
+                    f"candidate_k=`{data.get('candidate_k', 0)}` fusion=`{data.get('fusion', 'n/a')}`"
+                )
+                diagnostics = data.get("metadata", {}).get("diagnostics", {}) if isinstance(data.get("metadata"), dict) else {}
+                if diagnostics:
+                    st.caption(
+                        "Reason: "
+                        f"{diagnostics.get('reason_code', 'ok')} | action={diagnostics.get('suggested_action', 'proceed_with_rag')}"
+                    )
+                    if diagnostics.get("rewrite_notes"):
+                        st.caption(f"Rewrite: {diagnostics.get('rewrite_notes')}")
+            elif event_name == "citation_trace":
+                st.markdown(f"- Citations packed: `{len(data.get('citations', []))}`")
+            elif event_name == "tool_call":
+                st.markdown(f"- Tool call: `{event.get('name')}`")
+                st.json(event.get("args", {}))
+            elif event_name == "tool_result":
+                ok = data.get("success")
+                st.markdown(f"- Tool result: `{event.get('name')}` success=`{ok}`")
+                if data.get("error"):
+                    st.caption(data.get("error"))
+            elif event_name == "plan_assessment":
+                st.markdown(
+                    f"- Plan assessment: tools=`{data.get('tool_call_count', 0)}` "
+                    f"mode=`{data.get('recommended_mode', 'execute')}` "
+                    f"warnings=`{data.get('warnings', [])}`"
+                )
+                if data.get("duplicate_signature_count", 0):
+                    st.caption(
+                        f"Duplicate signatures: {data.get('duplicate_signature_count', 0)}"
+                    )
+            elif event_name == "failure_recovery":
+                st.markdown(
+                    f"- Recovery: action=`{data.get('action', 'fallback_answer')}` "
+                    f"reason=`{data.get('reason', 'tool_failure')}`"
+                )
+                if data.get("instruction"):
+                    st.caption(data.get("instruction"))
+            elif event_name == "answer_guard":
+                st.markdown(
+                    f"- Answer guard: grounded=`{data.get('grounded')}` "
+                    f"warnings=`{data.get('warnings', [])}`"
+                )
+                if data.get("recommended_action"):
+                    st.caption(
+                        f"Guard action: {data.get('recommended_action')} | reason={data.get('reason', '')}"
+                    )
+            elif event_name == "self_correction":
+                st.markdown(f"- Self correction: {event.get('message') or data.get('error')}")
+                if data:
+                    st.markdown(
+                        f"- Strategy: `{data.get('repair_strategy', 'n/a')}` "
+                        f"retryable=`{data.get('retryable')}` "
+                        f"remaining_budget=`{data.get('remaining_self_corrections')}`"
+                    )
+                    if data.get("diagnosis"):
+                        st.caption(f"Diagnosis: {data.get('diagnosis')}")
+                    if data.get("suggested_tool"):
+                        st.caption(f"Suggested tool: {data.get('suggested_tool')}")
+            elif event_name == "reasoning":
+                st.markdown("- Reasoning snippet")
+                st.code(event.get("content", ""), language="text")
+
+
+def compact_event_summary_v2(events: List[Dict[str, Any]]) -> str:
+    if not events:
+        return ""
+    parts: List[str] = []
+    for event in events[-8:]:
+        name = event.get("event")
+        data = event.get("data", {}) or {}
+        if name == "supervisor_route":
+            parts.append(f"route:{data.get('worker_kind') or data.get('worker')}")
+        elif name == "context_window_trace":
+            parts.append(
+                f"context:{data.get('selected_turn_count', 0)}/{data.get('budget', 0)}"
+            )
+        elif name == "multi_agent_plan":
+            parts.append(f"plan2:{data.get('task_count', 0)}")
+        elif name == "collaborator_trace":
+            parts.append(f"collab:{data.get('worker', 'unknown')}")
+        elif name == "task_recovery":
+            parts.append(f"resume:{data.get('route_worker', 'unknown')}")
+        elif name == "retrieval_trace":
+            parts.append(f"retrieval:{data.get('hit_count', 0)}")
+        elif name == "citation_trace":
+            parts.append(f"citations:{len(data.get('citations', []))}")
+        elif name == "tool_call":
+            parts.append(f"tool:{event.get('name')}")
+        elif name == "tool_result":
+            parts.append(f"result:{event.get('name')}")
+        elif name == "plan_assessment":
+            parts.append(f"plan:{data.get('recommended_mode', 'execute')}")
+        elif name == "failure_recovery":
+            parts.append(f"recover:{data.get('action', 'fallback')}")
+        elif name == "answer_guard":
+            parts.append("guard")
+        elif name == "error":
+            parts.append("error")
+    return " -> ".join(parts)
+
+
 def stream_backend_answer(prompt: str) -> Dict[str, Any]:
-    if st.session_state.chat_mode == "agent":
-        path = "/agent/stream"
-        payload = {
-            "session_id": st.session_state.session_id,
-            "query": prompt,
-            **runtime_payload(),
-        }
-    else:
-        path = "/chat/stream"
-        payload = {
-            "session_id": st.session_state.session_id,
-            "query": prompt,
-            "mode": st.session_state.chat_mode,
-            "collection_name": RAG_COLLECTION if st.session_state.chat_mode == "rag" else DEFAULT_COLLECTION,
-            **runtime_payload(),
-        }
+    contract = request_contract_preview(prompt)
+    endpoint = str(contract.get("endpoint") or "/api/chat/stream")
+    payload = contract.get("payload", {})
+    path = endpoint.removeprefix("/api")
 
     answer = ""
     events: List[Dict[str, Any]] = []
@@ -603,10 +1049,16 @@ def stream_backend_answer(prompt: str) -> Dict[str, Any]:
 
                 if event_name in {
                     "supervisor_route",
+                    "context_window_trace",
+                    "multi_agent_plan",
+                    "collaborator_trace",
+                    "task_recovery",
                     "retrieval_trace",
                     "citation_trace",
                     "tool_call",
                     "tool_result",
+                    "plan_assessment",
+                    "failure_recovery",
                     "answer_guard",
                     "self_correction",
                     "reasoning",
@@ -625,7 +1077,7 @@ def stream_backend_answer(prompt: str) -> Dict[str, Any]:
 
                 if answer:
                     text_box.markdown(answer + "▌")
-                summary = compact_event_summary(events)
+                summary = compact_event_summary_v2(events)
                 if summary:
                     trace_box.markdown(f"<div class='trace-box'>{summary}</div>", unsafe_allow_html=True)
 
@@ -656,9 +1108,9 @@ def render_kb_workspace() -> None:
     files = payload.get("data", []) if isinstance(payload.get("data", []), list) else []
     total_chunks = sum(int(item.get("chunk_count", 0)) for item in files if isinstance(item, dict))
 
-    st.markdown('<p class="page-title">知识库管理</p>', unsafe_allow_html=True)
+    st.markdown('<p class="page-title">Knowledge Base</p>', unsafe_allow_html=True)
     st.markdown(
-        '<p class="page-subtitle">用于维护后端统一知识库矩阵。问答入口会由 RAG/Agent 自动调用这些知识。</p>',
+        '<p class="page-subtitle">Manage the offline Markdown knowledge-base collections used by Knowledge Q&A and Agent retrieval.</p>',
         unsafe_allow_html=True,
     )
 
@@ -667,12 +1119,13 @@ def render_kb_workspace() -> None:
         st.markdown(
             f"""
 <div class="header-card">
-  <div class="section-title">默认知识库矩阵</div>
+  <div class="section-title">Indexed collection</div>
   <div class="muted">Collection: {collection_name}</div>
   <div style="margin-top:.65rem;">
-    <span class="metric-pill">{len(files)} 个文件</span>
-    <span class="metric-pill">{total_chunks} 个文本块</span>
+    <span class="metric-pill">{len(files)} files</span>
+    <span class="metric-pill">{total_chunks} chunks</span>
     <span class="metric-pill">Chroma + Whoosh</span>
+    <span class="metric-pill">RAG scope default: {current_rag_scope_label()}</span>
   </div>
 </div>
 """,
@@ -680,34 +1133,34 @@ def render_kb_workspace() -> None:
         )
     with top_right:
         with st.container(border=True):
-            st.markdown("#### 上传结构化 Markdown")
+            st.markdown("#### Upload structured Markdown")
             uploaded_file = st.file_uploader(
-                "选择 Markdown 文件",
+                "Choose a Markdown file",
                 type=["md"],
                 accept_multiple_files=False,
                 label_visibility="collapsed",
             )
             upload_cols = st.columns([0.25, 0.75])
-            if upload_cols[0].button("上传入库", type="primary", use_container_width=True, disabled=uploaded_file is None):
+            if upload_cols[0].button("Ingest", type="primary", use_container_width=True, disabled=uploaded_file is None):
                 result = upload_kb_file(uploaded_file, collection_name)
                 if result.get("status") == "success":
-                    st.success(result.get("message", "上传成功"))
+                    st.success(result.get("message", "Upload succeeded"))
                     st.rerun()
                 else:
-                    st.error(result.get("message", "上传失败"))
-            upload_cols[1].caption("当前仅接收已清洗、已结构化的 Markdown 文档。")
+                    st.error(result.get("message", "Upload failed"))
+            upload_cols[1].caption("Only cleaned, structured Markdown files are accepted in the current pipeline.")
 
     st.write("")
     with st.container(border=True):
-        st.markdown("#### 文档列表")
+        st.markdown("#### Indexed files")
         if not files:
-            st.info("当前知识库还没有文档。")
+            st.info("This collection does not contain indexed files yet.")
         else:
             header = st.columns([0.45, 0.18, 0.2, 0.17])
-            header[0].markdown("**文件名**")
-            header[1].markdown("**文本块**")
-            header[2].markdown("**双库状态**")
-            header[3].markdown("**操作**")
+            header[0].markdown("**Source file**")
+            header[1].markdown("**Chunks**")
+            header[2].markdown("**Store consistency**")
+            header[3].markdown("**Action**")
             st.divider()
             for item in files:
                 source_file = item.get("source_file", "")
@@ -715,30 +1168,30 @@ def render_kb_workspace() -> None:
                 row = st.columns([0.45, 0.18, 0.2, 0.17])
                 row[0].markdown(f"`{source_file}`")
                 row[1].markdown(str(item.get("chunk_count", 0)))
-                row[2].markdown("一致" if consistent else "需检查")
-                if row[3].button("删除", key=f"kb_delete_{source_file}", use_container_width=True):
+                row[2].markdown("Consistent" if consistent else "Needs review")
+                if row[3].button("Delete", key=f"kb_delete_{source_file}", use_container_width=True):
                     result = delete_kb_file(source_file, collection_name)
                     if result.get("status") == "success":
-                        st.success(f"已删除 {source_file}")
+                        st.success(f"Deleted {source_file}")
                         st.rerun()
                     else:
-                        st.error(result.get("message", "删除失败"))
+                        st.error(result.get("message", "Delete failed"))
 
         st.divider()
         danger_cols = st.columns([0.22, 0.78])
-        if danger_cols[0].button("删除全部文档", use_container_width=True, disabled=not files):
+        if danger_cols[0].button("Delete all", use_container_width=True, disabled=not files):
             st.session_state.kb_confirm_delete_all = True
         if st.session_state.kb_confirm_delete_all and files:
-            danger_cols[1].warning("再次点击确认会删除当前默认知识库内全部文档。")
-            if danger_cols[1].button("确认删除全部", type="primary"):
+            danger_cols[1].warning("Click again to remove every indexed file from the current collection.")
+            if danger_cols[1].button("Confirm delete all", type="primary"):
                 for item in files:
                     delete_kb_file(item.get("source_file", ""), collection_name)
                 st.session_state.kb_confirm_delete_all = False
                 st.rerun()
 
-    with st.expander("新建知识库入口", expanded=False):
-        st.text_input("知识库名称", value="future_collection", disabled=True)
-        st.caption("多知识库命名空间入口已预留；问答请求默认使用 __all__ 让后端跨集合检索。")
+    with st.expander("Knowledge-base notes", expanded=False):
+        st.text_input("Future collection name", value="future_collection", disabled=True)
+        st.caption("Knowledge Q&A can target one collection or `__all__`; Agent retrieval still defaults to cross-collection search.")
 
 
 def render_history_workspace() -> None:
@@ -746,11 +1199,11 @@ def render_history_workspace() -> None:
         render_chat_workspace()
         return
 
-    st.markdown('<p class="page-title">聊天记录</p>', unsafe_allow_html=True)
-    st.markdown('<p class="page-subtitle">选择左侧历史会话恢复上下文，或新建一轮对话。</p>', unsafe_allow_html=True)
+    st.markdown('<p class="page-title">History</p>', unsafe_allow_html=True)
+    st.markdown('<p class="page-subtitle">Open a previous session from the sidebar or start a new one.</p>', unsafe_allow_html=True)
     sessions = fetch_sessions()
     if not sessions:
-        st.info("暂无聊天记录。")
+        st.info("No saved sessions yet.")
         return
 
     with st.container(border=True):
@@ -759,7 +1212,7 @@ def render_history_workspace() -> None:
             cols = st.columns([0.55, 0.25, 0.2])
             cols[0].markdown(f"**{summarize(session.get('title', ''), 56)}**")
             cols[1].caption(session.get("updated_at", ""))
-            if cols[2].button("打开", key=f"history_open_{session_id}", use_container_width=True):
+            if cols[2].button("Open", key=f"history_open_{session_id}", use_container_width=True):
                 load_session(session_id)
                 st.rerun()
 
@@ -769,10 +1222,10 @@ def handle_chat_input() -> None:
         return
 
     placeholder = {
-        "agent": "输入复杂任务，智能体会自动选择 RAG 或工具链路...",
-        "rag": "输入需要知识库支撑的问题，回答会带引用...",
-        "quick": "输入消息开始普通问答...",
-    }.get(st.session_state.chat_mode, "输入消息开始对话...")
+        "agent": "Describe a multi-step task. The agent will route across chat, retrieval, and tools.",
+        "rag": "Ask a knowledge-grounded question. The answer will include retrieval traces and citations when available.",
+        "quick": "Type a general question to start chatting.",
+    }.get(st.session_state.chat_mode, "Type a message to begin...")
 
     prompt = st.chat_input(placeholder)
     if not prompt:

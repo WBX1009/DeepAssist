@@ -37,6 +37,8 @@ class RetrievalConfig:
 class HybridRetriever:
     """Hybrid retriever with weighted RRF, graceful degradation, and trace metadata."""
 
+    _LOW_RELEVANCE_THRESHOLD = 0.35
+
     def __init__(
         self,
         vector_db: BaseVectorDB,
@@ -115,8 +117,9 @@ class HybridRetriever:
             vector_weight=effective_vector_weight,
             keyword_weight=effective_keyword_weight,
         )
+        rerank_query = self._build_rerank_query(query_plan)
         final_docs, rerank_trace = self._rerank(
-            query=query_plan.normalized_query,
+            query=rerank_query,
             documents=fused_candidates,
             top_k=effective_top_k,
         )
@@ -136,6 +139,12 @@ class HybridRetriever:
                 "vector": vector_trace,
                 "keyword": keyword_trace,
             },
+            metadata=self._build_retrieval_diagnostics(
+                query_plan=query_plan,
+                vector_trace=vector_trace,
+                keyword_trace=keyword_trace,
+                final_docs=final_docs,
+            ),
         )
         logger.info(
             "Retrieval completed: vector=%s keyword=%s fused=%s",
@@ -144,6 +153,60 @@ class HybridRetriever:
             len(final_docs),
         )
         return result
+
+    def _build_retrieval_diagnostics(
+        self,
+        query_plan: QueryPlan,
+        vector_trace: RetrievalChannelTrace,
+        keyword_trace: RetrievalChannelTrace,
+        final_docs: List[DocumentChunk],
+    ) -> Dict[str, object]:
+        best_score = final_docs[0].score if final_docs else None
+        reason_code = "ok"
+        reason_message = "retrieval_ready"
+        suggested_action = "proceed_with_rag"
+
+        if not vector_trace.success and not keyword_trace.success:
+            reason_code = "all_channels_failed"
+            reason_message = "vector_and_keyword_channels_failed"
+            suggested_action = "fallback_to_chat"
+        elif not final_docs:
+            reason_code = "no_hits"
+            reason_message = "no_documents_retrieved_after_fusion"
+            suggested_action = "fallback_to_chat"
+        elif (best_score or 0.0) < self._LOW_RELEVANCE_THRESHOLD:
+            reason_code = "low_relevance"
+            reason_message = "top_document_score_below_threshold"
+            suggested_action = "fallback_to_chat"
+        elif not vector_trace.success or not keyword_trace.success:
+            reason_code = "partial_channel_failure"
+            reason_message = "one_retrieval_channel_failed_but_the_other_returned_candidates"
+            suggested_action = "proceed_with_warning"
+        elif (vector_trace.returned == 0) != (keyword_trace.returned == 0):
+            reason_code = "single_channel_recall"
+            reason_message = "only_one_retrieval_channel_contributed_candidates"
+            suggested_action = "proceed_with_warning"
+
+        return {
+            "diagnostics": {
+                "reason_code": reason_code,
+                "reason_message": reason_message,
+                "suggested_action": suggested_action,
+                "best_score": best_score,
+                "low_relevance_threshold": self._LOW_RELEVANCE_THRESHOLD,
+                "rewrite_applied": query_plan.metadata.get("rewrite_applied", False),
+                "rewrite_notes": query_plan.metadata.get("rewrite_notes", []),
+                "domain_hints": query_plan.metadata.get("domain_hints", []),
+                "semantic_queries": query_plan.semantic_queries,
+                "keyword_queries": query_plan.keyword_queries,
+                "rerank_query": self._build_rerank_query(query_plan),
+                "sub_queries": query_plan.sub_queries,
+                "channel_summary": {
+                    "vector": vector_trace.model_dump(exclude_none=True),
+                    "keyword": keyword_trace.model_dump(exclude_none=True),
+                },
+            }
+        }
 
     def _rerank(
         self,
@@ -391,6 +454,20 @@ class HybridRetriever:
             final_results.append(chunk)
 
         return final_results
+
+    def _build_rerank_query(self, query_plan: QueryPlan) -> str:
+        candidates = [
+            query_plan.rewritten_query,
+            " ".join(query_plan.keyword_queries or []),
+            " ".join(query_plan.semantic_queries or []),
+            query_plan.keyword_query,
+            query_plan.normalized_query,
+        ]
+        for candidate in candidates:
+            normalized = " ".join((candidate or "").split()).strip()
+            if normalized:
+                return normalized
+        return query_plan.original_query
 
     def _accumulate_rrf(
         self,

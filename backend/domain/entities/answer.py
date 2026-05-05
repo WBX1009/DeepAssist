@@ -7,6 +7,8 @@ class AnswerGroundingReport(BaseModel):
     """Lightweight post-generation grounding report for a RAG answer."""
 
     grounded: bool
+    recommended_action: str = "accept"
+    reason: str = ""
     citation_count: int = 0
     used_citations: List[str] = Field(default_factory=list)
     missing_citations: List[str] = Field(default_factory=list)

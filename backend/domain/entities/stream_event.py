@@ -70,8 +70,32 @@ class StreamEvent(BaseModel):
         return cls(event="citation_trace", data=data)
 
     @classmethod
+    def context_window_trace(cls, data: Dict[str, Any]) -> "StreamEvent":
+        return cls(event="context_window_trace", data=data)
+
+    @classmethod
+    def multi_agent_plan(cls, data: Dict[str, Any]) -> "StreamEvent":
+        return cls(event="multi_agent_plan", data=data)
+
+    @classmethod
+    def collaborator_trace(cls, data: Dict[str, Any]) -> "StreamEvent":
+        return cls(event="collaborator_trace", data=data)
+
+    @classmethod
     def answer_guard(cls, data: Dict[str, Any]) -> "StreamEvent":
         return cls(event="answer_guard", data=data)
+
+    @classmethod
+    def plan_assessment(cls, data: Dict[str, Any]) -> "StreamEvent":
+        return cls(event="plan_assessment", data=data)
+
+    @classmethod
+    def failure_recovery(cls, message: str, data: Dict[str, Any]) -> "StreamEvent":
+        return cls(event="failure_recovery", message=message, data=data)
+
+    @classmethod
+    def task_recovery(cls, data: Dict[str, Any]) -> "StreamEvent":
+        return cls(event="task_recovery", data=data)
 
     @classmethod
     def self_correction(cls, message: str, data: Dict[str, Any]) -> "StreamEvent":

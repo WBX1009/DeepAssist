@@ -4,6 +4,7 @@ from typing import Any, Callable, List, Optional
 from backend.application.agent_app import AgentApplication
 from backend.application.chat_app import ChatApplication
 from backend.application.kb_app import KnowledgeBaseApp
+from backend.application.runtime_app import RuntimeApplication
 from backend.common.event_bus import event_bus
 from backend.common.logger import get_logger
 from backend.domain.interfaces.embedding import BaseEmbedding
@@ -22,6 +23,7 @@ from backend.infrastructure.tools.file_ops import (
     read_local_file,
     write_local_file,
 )
+from backend.infrastructure.tools.kb_catalog_tool import KnowledgeBaseCatalogTool
 from backend.infrastructure.tools.python_ops import execute_python_code
 from backend.infrastructure.tools.rag_tool import KnowledgeBaseTool
 from backend.infrastructure.tools.sql_ops import query_business_database
@@ -30,7 +32,13 @@ from backend.services.agent.engine import AgentEngine
 from backend.services.agent.intent_router import IntentRouter
 from backend.services.agent.supervisor import AgentSupervisor
 from backend.services.agent.tooling import ToolPolicy, ToolRegistry
-from backend.services.agent.workers import ChatWorker, RAGWorker, ToolAgentWorker
+from backend.services.agent.task_decomposer import TaskDecomposer
+from backend.services.agent.workers import (
+    ChatWorker,
+    OrchestratorWorker,
+    RAGWorker,
+    ToolAgentWorker,
+)
 from backend.services.context_engine import ContextEngine
 from backend.services.profile_extractor import ProfileExtractor
 from backend.services.rag.answer_guard import SourceAwareResponseGuard
@@ -41,7 +49,10 @@ from backend.services.rag.pipeline import RAGPipeline
 from backend.services.rag.query_planner import QueryPlanner
 from backend.services.rag.query_rewriter import QueryRewriteService
 from backend.services.rag.reranker import LexicalOverlapReranker
+from backend.services.session.context_window_manager import PriorityContextWindowManager
+from backend.services.session.long_term_memory_recall import LongTermMemoryRecallService
 from backend.services.session.manager import SessionManager
+from backend.services.session.summary_compressor import ConversationSummaryCompressor
 from backend.common.config import settings
 
 logger = get_logger(__name__)
@@ -170,7 +181,27 @@ def get_rag_pipeline() -> Optional[RAGPipeline]:
 
 @lru_cache()
 def get_session_manager() -> SessionManager:
-    return SessionManager(memory_store=get_memory_store())
+    return SessionManager(
+        memory_store=get_memory_store(),
+        context_window_manager=get_context_window_manager(),
+        summary_compressor=get_summary_compressor(),
+        memory_recall=get_long_term_memory_recall_service(),
+    )
+
+
+@lru_cache()
+def get_context_window_manager() -> PriorityContextWindowManager:
+    return PriorityContextWindowManager()
+
+
+@lru_cache()
+def get_summary_compressor() -> ConversationSummaryCompressor:
+    return ConversationSummaryCompressor()
+
+
+@lru_cache()
+def get_long_term_memory_recall_service() -> LongTermMemoryRecallService:
+    return LongTermMemoryRecallService(get_memory_store())
 
 
 @lru_cache()
@@ -181,6 +212,11 @@ def get_context_engine() -> ContextEngine:
 @lru_cache()
 def get_intent_router() -> IntentRouter:
     return IntentRouter()
+
+
+@lru_cache()
+def get_task_decomposer() -> TaskDecomposer:
+    return TaskDecomposer()
 
 
 @lru_cache()
@@ -201,6 +237,7 @@ def get_profile_extractor() -> ProfileExtractor:
 def _build_agent_tools(
     retriever: Optional[HybridRetriever],
     rag_pipeline: Optional[RAGPipeline],
+    kb_app: KnowledgeBaseApp,
 ) -> List[Callable[..., Any]]:
     tools: List[Callable[..., Any]] = [
         read_local_file,
@@ -210,6 +247,13 @@ def _build_agent_tools(
         execute_python_code,
         query_business_database,
     ]
+    kb_catalog_tool = KnowledgeBaseCatalogTool(kb_app)
+    tools.extend(
+        [
+            kb_catalog_tool.list_knowledge_base_collections,
+            kb_catalog_tool.list_knowledge_base_files,
+        ]
+    )
 
     if retriever is not None:
         tools.append(
@@ -217,7 +261,7 @@ def _build_agent_tools(
                 retriever=retriever,
                 rag_pipeline=rag_pipeline,
                 collection_name="__all__",
-            ).search
+            ).search_knowledge_base
         )
 
     return tools
@@ -226,7 +270,7 @@ def _build_agent_tools(
 @lru_cache()
 def get_tool_registry() -> ToolRegistry:
     return ToolRegistry.from_callables(
-        tools=_build_agent_tools(get_retriever(), get_rag_pipeline()),
+        tools=_build_agent_tools(get_retriever(), get_rag_pipeline(), get_kb_app()),
         policy=ToolPolicy(max_result_chars=4000),
     )
 
@@ -244,24 +288,35 @@ def get_agent_supervisor() -> AgentSupervisor:
     llm = get_llm()
     context_engine = get_context_engine()
     rag_pipeline = get_rag_pipeline()
+    chat_worker = ChatWorker(llm=llm, context_engine=context_engine)
+    rag_worker = (
+        RAGWorker(
+            llm=llm,
+            context_engine=context_engine,
+            rag_pipeline=rag_pipeline,
+            collection_name="__all__",
+        )
+        if rag_pipeline is not None
+        else None
+    )
+    tool_worker = ToolAgentWorker(
+        agent_engine=get_agent_engine(),
+        context_engine=context_engine,
+    )
 
     return AgentSupervisor(
         intent_router=get_intent_router(),
-        chat_worker=ChatWorker(llm=llm, context_engine=context_engine),
-        rag_worker=(
-            RAGWorker(
-                llm=llm,
-                context_engine=context_engine,
-                rag_pipeline=rag_pipeline,
-                collection_name="__all__",
-            )
-            if rag_pipeline is not None
-            else None
+        chat_worker=chat_worker,
+        rag_worker=rag_worker,
+        tool_worker=tool_worker,
+        orchestrator_worker=OrchestratorWorker(
+            llm=llm,
+            chat_worker=chat_worker,
+            rag_worker=rag_worker,
+            tool_worker=tool_worker,
+            task_decomposer=get_task_decomposer(),
         ),
-        tool_worker=ToolAgentWorker(
-            agent_engine=get_agent_engine(),
-            context_engine=context_engine,
-        ),
+        task_decomposer=get_task_decomposer(),
     )
 
 
@@ -304,4 +359,12 @@ def get_kb_app() -> KnowledgeBaseApp:
         vector_db=get_vector_db(),
         keyword_db=get_keyword_db(),
         health_inspector=get_vector_index_health_inspector(),
+    )
+
+
+@lru_cache()
+def get_runtime_app() -> RuntimeApplication:
+    return RuntimeApplication(
+        kb_app=get_kb_app(),
+        tool_registry=get_tool_registry(),
     )
