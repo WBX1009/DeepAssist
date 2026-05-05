@@ -31,6 +31,21 @@ class LexicalOverlapReranker(BaseReranker):
     """Deterministic fallback reranker until a cross-encoder adapter is installed."""
 
     _term_pattern = re.compile(r"[A-Za-z0-9_./#:+-]+|[\u4e00-\u9fff]{2,}")
+    _generic_query_terms = {
+        "资料",
+        "数据库",
+        "知识库",
+        "回答",
+        "查找",
+        "找到",
+        "没有",
+        "根据",
+        "详细",
+        "解释",
+        "一下",
+        "关于",
+        "外挂",
+    }
 
     def __init__(self, config: RerankerConfig | None = None):
         self.config = config or RerankerConfig()
@@ -84,11 +99,27 @@ class LexicalOverlapReranker(BaseReranker):
         return final_docs
 
     def _terms(self, text: str) -> Set[str]:
-        return {
-            term.lower()
-            for term in self._term_pattern.findall(text or "")
-            if len(term.strip()) > 1
-        }
+        terms: Set[str] = set()
+        for token in self._term_pattern.findall(text or ""):
+            normalized = token.strip().lower()
+            if not normalized:
+                continue
+            if re.search(r"[\u4e00-\u9fff]", normalized):
+                for part in self._segment_chinese(normalized):
+                    if len(part) > 1 and part not in self._generic_query_terms:
+                        terms.add(part)
+                continue
+            if len(normalized) > 1 and normalized not in self._generic_query_terms:
+                terms.add(normalized)
+        return terms
+
+    def _segment_chinese(self, text: str) -> List[str]:
+        try:
+            import jieba
+
+            return [part.strip().lower() for part in jieba.lcut(text) if part.strip()]
+        except Exception:
+            return [text]
 
     def _lexical_overlap(self, query_terms: Set[str], doc: DocumentChunk) -> float:
         if not query_terms:

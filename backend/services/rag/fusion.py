@@ -117,8 +117,9 @@ class HybridRetriever:
             vector_weight=effective_vector_weight,
             keyword_weight=effective_keyword_weight,
         )
+        rerank_query = self._build_rerank_query(query_plan)
         final_docs, rerank_trace = self._rerank(
-            query=query_plan.normalized_query,
+            query=rerank_query,
             documents=fused_candidates,
             top_k=effective_top_k,
         )
@@ -198,6 +199,7 @@ class HybridRetriever:
                 "domain_hints": query_plan.metadata.get("domain_hints", []),
                 "semantic_queries": query_plan.semantic_queries,
                 "keyword_queries": query_plan.keyword_queries,
+                "rerank_query": self._build_rerank_query(query_plan),
                 "sub_queries": query_plan.sub_queries,
                 "channel_summary": {
                     "vector": vector_trace.model_dump(exclude_none=True),
@@ -452,6 +454,20 @@ class HybridRetriever:
             final_results.append(chunk)
 
         return final_results
+
+    def _build_rerank_query(self, query_plan: QueryPlan) -> str:
+        candidates = [
+            query_plan.rewritten_query,
+            " ".join(query_plan.keyword_queries or []),
+            " ".join(query_plan.semantic_queries or []),
+            query_plan.keyword_query,
+            query_plan.normalized_query,
+        ]
+        for candidate in candidates:
+            normalized = " ".join((candidate or "").split()).strip()
+            if normalized:
+                return normalized
+        return query_plan.original_query
 
     def _accumulate_rrf(
         self,

@@ -105,10 +105,21 @@ class QueryPlanner:
             normalized = term.strip().strip(".,!?;:()[]{}")
             if not normalized:
                 continue
-            if normalized.lower() in self._stop_words:
-                continue
-            terms.append(normalized)
+            for token in self._segment_term(normalized):
+                if token.lower() in self._stop_words:
+                    continue
+                terms.append(token)
         return self._dedupe(terms)
+
+    def _segment_term(self, term: str) -> List[str]:
+        if not re.search(r"[\u4e00-\u9fff]", term):
+            return [term]
+        try:
+            import jieba
+
+            return [item.strip() for item in jieba.lcut(term) if item.strip()]
+        except Exception:
+            return [term]
 
     def _build_keyword_query(
         self,

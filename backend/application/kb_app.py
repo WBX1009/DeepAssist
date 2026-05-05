@@ -1,8 +1,10 @@
 from backend.common.logger import get_logger
+from backend.common.config import settings
 from backend.domain.entities.knowledge_base import KnowledgeBaseFile
 from backend.domain.interfaces.embedding import BaseEmbedding
 from backend.domain.interfaces.keyword_db import BaseKeywordDB
 from backend.domain.interfaces.vector_db import BaseVectorDB
+from backend.infrastructure.databases.kb_manifest_store import KnowledgeBaseManifestStore
 from backend.infrastructure.databases.vector_index_health import VectorIndexHealthInspector
 from backend.services.rag.chunking import DocumentChunker
 
@@ -25,6 +27,7 @@ class KnowledgeBaseApp:
         self.vector_db = vector_db
         self.keyword_db = keyword_db
         self.health_inspector = health_inspector
+        self.manifest_store = KnowledgeBaseManifestStore(settings.KB_MANIFEST_PATH)
 
     def _rollback_vector_write(self, collection_name: str, file_name: str) -> bool:
         if self.vector_db is None:
@@ -49,6 +52,16 @@ class KnowledgeBaseApp:
 
     def list_files(self, collection_name: str = "tech_docs_kb") -> dict:
         """Return file-level KB inventory merged from vector and keyword stores."""
+        manifest_files = self.manifest_store.list_files(collection_name)
+        if manifest_files:
+            return {
+                "status": "success",
+                "collection_name": collection_name,
+                "data": manifest_files,
+                "errors": {},
+                "source": "manifest",
+            }
+
         records: dict[str, dict] = {}
         errors: dict[str, str] = {}
 
@@ -87,17 +100,37 @@ class KnowledgeBaseApp:
 
         files.sort(key=lambda item: item["source_file"].lower())
         status = "success" if not errors else ("partial_success" if files else "error")
+        if files:
+            self.manifest_store.replace_collection(
+                collection_name=collection_name,
+                files=files,
+                stores=sorted(
+                    {
+                        store
+                        for item in files
+                        if isinstance(item, dict)
+                        for store in item.get("stores", [])
+                    }
+                )
+                or ["vector", "keyword"],
+            )
         return {
             "status": status,
             "collection_name": collection_name,
             "data": files,
             "errors": errors,
+            "source": "live_scan",
         }
 
     def list_collections(self) -> dict:
         """Return collection-level inventory merged from vector and keyword stores."""
         records: dict[str, dict] = {}
         errors: dict[str, str] = {}
+        manifest_items = {
+            item.get("collection_name"): item
+            for item in self.manifest_store.list_collections()
+            if isinstance(item, dict) and item.get("collection_name")
+        }
 
         if self.vector_db is not None:
             try:
@@ -124,20 +157,17 @@ class KnowledgeBaseApp:
         collections = []
         for record in records.values():
             name = record["collection_name"]
-            file_payload = self.list_files(name)
-            files = file_payload.get("data", [])
             record["stores"] = sorted(set(record["stores"]))
-            record["file_count"] = len(files) if isinstance(files, list) else 0
-            record["chunk_count"] = sum(
-                int(item.get("chunk_count", 0))
-                for item in files
-                if isinstance(item, dict)
+            manifest_item = manifest_items.get(name, {})
+            record["file_count"] = int(manifest_item.get("file_count", 0) or 0)
+            record["chunk_count"] = int(manifest_item.get("chunk_count", 0) or 0)
+            record["consistent"] = bool(
+                manifest_item.get(
+                    "consistent",
+                    "vector" in record["stores"] and "keyword" in record["stores"],
+                )
             )
-            record["consistent"] = all(
-                bool(item.get("consistent"))
-                for item in files
-                if isinstance(item, dict)
-            ) if files else "vector" in record["stores"] and "keyword" in record["stores"]
+            record["metadata"] = manifest_item.get("metadata", {})
             collections.append(record)
 
         collections.sort(key=lambda item: item["collection_name"].lower())
@@ -146,6 +176,7 @@ class KnowledgeBaseApp:
             "status": status,
             "data": collections,
             "errors": errors,
+            "source": "manifest_summary",
         }
 
     def get_health_report(
@@ -232,6 +263,7 @@ class KnowledgeBaseApp:
             errors["keyword"] = "Keyword database is unavailable"
 
         if vector_success and keyword_success:
+            self.manifest_store.remove_file(collection_name, source_file)
             logger.info("KB source [%s] deleted from both stores", source_file)
             return {
                 "status": "success",
@@ -301,6 +333,19 @@ class KnowledgeBaseApp:
 
             k_success = self.keyword_db.build_index(collection_name, chunks)
             if k_success:
+                first_meta = chunks[0].metadata if chunks else {}
+                self.manifest_store.upsert_file(
+                    collection_name=collection_name,
+                    source_file=file_name,
+                    chunk_count=len(chunks),
+                    metadata={
+                        "collection_name": collection_name,
+                        "source_format": "markdown",
+                        "source_type": "markdown",
+                        "language": first_meta.get("language", "unknown"),
+                        "title_path": first_meta.get("heading_path"),
+                    },
+                )
                 logger.info("Document %s ingested successfully with %s chunks", file_name, len(chunks))
                 return {"status": "success", "message": f"Successfully processed {len(chunks)} chunks"}
 

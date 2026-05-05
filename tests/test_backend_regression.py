@@ -1,5 +1,7 @@
 import json
+import tempfile
 import unittest
+from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 
@@ -30,7 +32,9 @@ from backend.services.context_engine import ContextEngine
 from backend.services.rag.answer_guard import SourceAwareResponseGuard
 from backend.services.rag.fusion import HybridRetriever
 from backend.services.rag.query_planner import QueryPlanner
+from backend.services.rag.query_rewriter import QueryRewriteService
 from backend.services.session.manager import SessionManager
+from backend.infrastructure.databases.kb_manifest_store import KnowledgeBaseManifestStore
 
 
 class FakeMemoryStore(BaseMemoryStore):
@@ -253,6 +257,22 @@ class FakeKBApp:
                 },
             ],
         }
+
+
+class SlowListSourcesVectorDB:
+    def list_collections(self):
+        return ["medical_kb"]
+
+    def list_sources(self, collection_name: str):
+        raise AssertionError("list_sources should not be called when manifest summary exists")
+
+
+class SlowListSourcesKeywordDB:
+    def list_collections(self):
+        return ["medical_kb"]
+
+    def list_sources(self, collection_name: str):
+        raise AssertionError("list_sources should not be called when manifest summary exists")
 
 
 class FakeEmbeddingModel:
@@ -855,6 +875,47 @@ class BackendRegressionTests(unittest.TestCase):
         self.assertTrue(any(item.get("name") == "read_local_file" for item in tools))
         self.assertTrue(any(item.get("id") == "__all__" for item in scopes))
         self.assertTrue(any(item.get("id") == "medical_kb" for item in scopes))
+
+    def test_query_rewriter_removes_instruction_tail_and_adds_synonym_hints(self):
+        result = QueryRewriteService().expand(
+            normalized_query="给我查找关于头疼的资料，根据数据库回答，没有查找到资料就说数据库没有",
+            keyword_query="给我查找关于头疼的资料 根据数据库回答 没有查找到资料就说数据库没有",
+            key_terms=["给我查找关于头疼的资料", "根据数据库回答", "没有查找到资料就说数据库没有"],
+            quoted_phrases=[],
+        )
+
+        self.assertTrue(any("instruction_tail_removed" == note for note in result.rewrite_notes))
+        self.assertTrue(any("synonym_expansion" == note for note in result.rewrite_notes))
+        self.assertIn("头痛", " ".join(result.keyword_queries))
+        self.assertFalse(any("数据库回答" in query for query in result.keyword_queries))
+
+    def test_kb_app_uses_manifest_summary_for_fast_collection_listing(self):
+        app = KnowledgeBaseApp(
+            chunker=object(),
+            embedding_model=None,
+            vector_db=SlowListSourcesVectorDB(),
+            keyword_db=SlowListSourcesKeywordDB(),
+            health_inspector=None,
+        )
+        with tempfile.TemporaryDirectory() as temp_dir:
+            manifest_path = Path(temp_dir) / "kb_manifest.json"
+            app.manifest_store = KnowledgeBaseManifestStore(str(manifest_path))
+            app.manifest_store.upsert_file(
+                collection_name="medical_kb",
+                source_file="data/sources/medical/train.json",
+                chunk_count=18,
+                metadata={"domain": "medical", "source_format": "json"},
+            )
+
+            payload = app.list_collections()
+            files_payload = app.list_files("medical_kb")
+
+        self.assertEqual(payload.get("status"), "success")
+        self.assertEqual(payload.get("source"), "manifest_summary")
+        self.assertEqual(payload.get("data")[0].get("file_count"), 1)
+        self.assertEqual(payload.get("data")[0].get("chunk_count"), 18)
+        self.assertEqual(files_payload.get("source"), "manifest")
+        self.assertEqual(files_payload.get("data")[0].get("source_file"), "data/sources/medical/train.json")
 
     def test_query_planner_emits_rewrite_metadata_for_short_technical_query(self):
         planner = QueryPlanner()
