@@ -67,9 +67,16 @@ class AgentLifecycle:
 
     def record_tool_result(self, result: ToolResult) -> Optional[str]:
         if result.success:
+            self.state.successful_tool_calls += 1
+            self.state.consecutive_tool_failures = 0
             return None
 
         self.state.tool_errors += 1
+        self.state.consecutive_tool_failures += 1
+        self.state.last_failed_tool_name = result.name
+        self.state.failed_tool_names[result.name] = (
+            self.state.failed_tool_names.get(result.name, 0) + 1
+        )
         if self.state.tool_errors < self.config.max_tool_errors:
             if self.state.self_corrections < self.config.max_self_corrections:
                 self.state.self_corrections += 1

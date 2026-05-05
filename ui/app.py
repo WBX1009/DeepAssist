@@ -700,6 +700,23 @@ def render_event_trace_v2(events: List[Dict[str, Any]]) -> None:
                 st.markdown(f"- Tool result: `{event.get('name')}` success=`{ok}`")
                 if data.get("error"):
                     st.caption(data.get("error"))
+            elif event_name == "plan_assessment":
+                st.markdown(
+                    f"- Plan assessment: tools=`{data.get('tool_call_count', 0)}` "
+                    f"mode=`{data.get('recommended_mode', 'execute')}` "
+                    f"warnings=`{data.get('warnings', [])}`"
+                )
+                if data.get("duplicate_signature_count", 0):
+                    st.caption(
+                        f"Duplicate signatures: {data.get('duplicate_signature_count', 0)}"
+                    )
+            elif event_name == "failure_recovery":
+                st.markdown(
+                    f"- Recovery: action=`{data.get('action', 'fallback_answer')}` "
+                    f"reason=`{data.get('reason', 'tool_failure')}`"
+                )
+                if data.get("instruction"):
+                    st.caption(data.get("instruction"))
             elif event_name == "answer_guard":
                 st.markdown(
                     f"- Answer guard: grounded=`{data.get('grounded')}` "
@@ -747,6 +764,10 @@ def compact_event_summary_v2(events: List[Dict[str, Any]]) -> str:
             parts.append(f"tool:{event.get('name')}")
         elif name == "tool_result":
             parts.append(f"result:{event.get('name')}")
+        elif name == "plan_assessment":
+            parts.append(f"plan:{data.get('recommended_mode', 'execute')}")
+        elif name == "failure_recovery":
+            parts.append(f"recover:{data.get('action', 'fallback')}")
         elif name == "answer_guard":
             parts.append("guard")
         elif name == "error":
@@ -811,6 +832,8 @@ def stream_backend_answer(prompt: str) -> Dict[str, Any]:
                     "citation_trace",
                     "tool_call",
                     "tool_result",
+                    "plan_assessment",
+                    "failure_recovery",
                     "answer_guard",
                     "self_correction",
                     "reasoning",

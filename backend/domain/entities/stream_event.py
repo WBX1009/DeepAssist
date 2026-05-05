@@ -78,6 +78,14 @@ class StreamEvent(BaseModel):
         return cls(event="answer_guard", data=data)
 
     @classmethod
+    def plan_assessment(cls, data: Dict[str, Any]) -> "StreamEvent":
+        return cls(event="plan_assessment", data=data)
+
+    @classmethod
+    def failure_recovery(cls, message: str, data: Dict[str, Any]) -> "StreamEvent":
+        return cls(event="failure_recovery", message=message, data=data)
+
+    @classmethod
     def self_correction(cls, message: str, data: Dict[str, Any]) -> "StreamEvent":
         return cls(event="self_correction", message=message, data=data)
 

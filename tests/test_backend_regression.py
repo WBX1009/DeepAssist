@@ -780,5 +780,135 @@ class BackendRegressionTests(unittest.TestCase):
         self.assertIn("根据当前知识库检索", answer_text)
 
 
+    def test_agent_engine_assesses_and_dedupes_duplicate_tool_calls_in_one_iteration(self):
+        execution_counter = {"count": 0}
+
+        def sample_tool(city: str) -> str:
+            execution_counter["count"] += 1
+            return f"weather:{city}"
+
+        first_response = SimpleNamespace(
+            content="",
+            tool_calls=[
+                {
+                    "id": "call-1",
+                    "type": "function",
+                    "function": {
+                        "name": "sample_tool",
+                        "arguments": json.dumps({"city": "beijing"}),
+                    },
+                },
+                {
+                    "id": "call-2",
+                    "type": "function",
+                    "function": {
+                        "name": "sample_tool",
+                        "arguments": json.dumps({"city": "beijing"}),
+                    },
+                },
+            ],
+            reasoning_content=None,
+        )
+        second_response = SimpleNamespace(
+            content="Done.",
+            tool_calls=[],
+            reasoning_content=None,
+        )
+        engine = AgentEngine(
+            llm=FakeAgentLLM([first_response, second_response]),
+            tool_registry=ToolRegistry.from_callables([sample_tool]),
+            run_config=AgentRunConfig(max_iterations=3, max_self_corrections=2),
+        )
+
+        events = list(
+            engine.stream_run(
+                [
+                    {"role": "system", "content": "agent"},
+                    {"role": "user", "content": "check weather twice"},
+                ]
+            )
+        )
+
+        self.assertEqual(execution_counter["count"], 1)
+        plan_events = [event for event in events if event.get("type") == "plan_assessment"]
+        self.assertTrue(plan_events)
+        self.assertEqual(plan_events[0]["data"].get("recommended_mode"), "simplify_plan")
+        self.assertIn(
+            "duplicate_tool_call_in_iteration",
+            plan_events[0]["data"].get("warnings", []),
+        )
+
+    def test_agent_engine_escalates_recovery_to_partial_result_finalize_after_repeated_failure(self):
+        def fetch_fact() -> str:
+            return "partial fact"
+
+        def failing_tool(target: str) -> str:
+            raise RuntimeError("temporary timeout while contacting upstream")
+
+        first_response = SimpleNamespace(
+            content="",
+            tool_calls=[
+                {
+                    "id": "call-1",
+                    "type": "function",
+                    "function": {"name": "fetch_fact", "arguments": json.dumps({})},
+                },
+                {
+                    "id": "call-2",
+                    "type": "function",
+                    "function": {
+                        "name": "failing_tool",
+                        "arguments": json.dumps({"target": "alpha"}),
+                    },
+                },
+            ],
+            reasoning_content=None,
+        )
+        second_response = SimpleNamespace(
+            content="",
+            tool_calls=[
+                {
+                    "id": "call-3",
+                    "type": "function",
+                    "function": {
+                        "name": "failing_tool",
+                        "arguments": json.dumps({"target": "alpha"}),
+                    },
+                }
+            ],
+            reasoning_content=None,
+        )
+        third_response = SimpleNamespace(
+            content="Recovered with partial results.",
+            tool_calls=[],
+            reasoning_content=None,
+        )
+        engine = AgentEngine(
+            llm=FakeAgentLLM([first_response, second_response, third_response]),
+            tool_registry=ToolRegistry.from_callables([fetch_fact, failing_tool]),
+            run_config=AgentRunConfig(max_iterations=4, max_self_corrections=3),
+        )
+
+        events = list(
+            engine.stream_run(
+                [
+                    {"role": "system", "content": "agent"},
+                    {"role": "user", "content": "solve with tools"},
+                ]
+            )
+        )
+
+        recovery_events = [event for event in events if event.get("type") == "failure_recovery"]
+        self.assertGreaterEqual(len(recovery_events), 2)
+        self.assertEqual(
+            recovery_events[-1]["data"].get("action"),
+            "finalize_with_partial_results",
+        )
+        self.assertEqual(
+            recovery_events[-1]["data"].get("successful_tool_calls"),
+            1,
+        )
+
+
 if __name__ == "__main__":
     unittest.main()

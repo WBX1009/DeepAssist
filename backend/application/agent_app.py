@@ -140,6 +140,7 @@ class AgentApplication:
                     )
 
                 elif event_type == "self_correction":
+                    data = event.get("data", {}) or {}
                     yield SSEManager.format_event(
                         StreamEvent.self_correction(
                             message=event.get("content", ""),
@@ -147,9 +148,29 @@ class AgentApplication:
                                 "tool_call_id": event.get("tool_call_id"),
                                 "name": event.get("name"),
                                 "error": event.get("error"),
+                                **data,
                                 "state": event.get("state", {}),
                             },
                         )
+                    )
+
+                elif event_type == "failure_recovery":
+                    yield SSEManager.format_event(
+                        StreamEvent.failure_recovery(
+                            message=event.get("content", ""),
+                            data={
+                                "tool_call_id": event.get("tool_call_id"),
+                                "name": event.get("name"),
+                                "error": event.get("error"),
+                                **(event.get("data", {}) or {}),
+                                "state": event.get("state", {}),
+                            },
+                        )
+                    )
+
+                elif event_type == "plan_assessment":
+                    yield SSEManager.format_event(
+                        StreamEvent.plan_assessment(event.get("data", {}))
                     )
 
                 elif event_type == "tool_call":
