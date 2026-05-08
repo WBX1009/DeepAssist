@@ -1,5 +1,8 @@
+from typing import List
+
 from backend.common.logger import get_logger
 from backend.common.config import settings
+from backend.domain.entities.document import DocumentChunk
 from backend.domain.entities.knowledge_base import KnowledgeBaseFile
 from backend.domain.interfaces.embedding import BaseEmbedding
 from backend.domain.interfaces.keyword_db import BaseKeywordDB
@@ -255,7 +258,7 @@ class KnowledgeBaseApp:
             try:
                 keyword_success = self.keyword_db.delete_by_source(collection_name, source_file)
                 if not keyword_success:
-                    errors["keyword"] = "Keyword database delete returned false"
+                    errors["keyword"] = "Keyword delete returned false"
             except Exception as exc:
                 logger.error("Keyword delete failed for %s: %s", source_file, exc)
                 errors["keyword"] = str(exc)
@@ -364,5 +367,89 @@ class KnowledgeBaseApp:
             if v_success:
                 logger.warning("Exception after vector write for %s; starting vector rollback", file_name)
                 self._rollback_vector_write(collection_name, file_name)
+
+            return {"status": "error", "message": f"Database write failed: {exc}"}
+
+    def process_chunks(
+        self,
+        collection_name: str,
+        chunks: List[DocumentChunk],
+    ) -> dict:
+        """
+        Ingest a batch of pre-chunked DocumentChunk objects into the specified collection.
+
+        This method computes embeddings for the provided chunks, writes them to the vector store
+        and keyword index, and handles rollback on failure. It returns a status dict describing
+        the outcome. Manifest updates are not performed here and should be handled externally
+        by the caller when batching across multiple calls.
+
+        Args:
+            collection_name: Name of the target knowledge base collection.
+            chunks: A list of DocumentChunk instances to ingest.
+
+        Returns:
+            A dictionary with keys "status" and additional information such as "count" on
+            success or "message" on error.
+        """
+        logger.info(
+            "Received batch ingestion request: %s chunks into collection %s",
+            len(chunks),
+            collection_name,
+        )
+
+        if not self._is_ready_for_ingestion():
+            logger.error("Batch ingestion rejected because dependencies are unavailable")
+            return {
+                "status": "error",
+                "message": "Knowledge-base ingestion dependencies are unavailable",
+            }
+
+        if not chunks:
+            return {"status": "error", "message": "Empty batch"}
+
+        try:
+            texts = [chunk.content for chunk in chunks]
+            embeddings = self.embedding.embed_documents(texts)
+        except Exception as exc:
+            logger.error("Embedding failed for batch: %s", exc)
+            return {"status": "error", "message": f"Embedding failed: {exc}"}
+
+        v_success = False
+        try:
+            v_success = self.vector_db.add_chunks(collection_name, chunks, embeddings)
+            if not v_success:
+                logger.error("Vector database write failed for batch")
+                return {"status": "error", "message": "Vector database write failed"}
+
+            k_success = self.keyword_db.build_index(collection_name, chunks)
+            if k_success:
+                return {"status": "success", "count": len(chunks)}
+
+            logger.error("Keyword index write failed for batch; starting vector rollback")
+            rollback_sources = set(
+                chunk.metadata.get("source_file")
+                or chunk.metadata.get("source_path")
+                for chunk in chunks
+            )
+            for source_file in rollback_sources:
+                if source_file:
+                    self._rollback_vector_write(collection_name, source_file)
+
+            return {
+                "status": "error",
+                "message": "Keyword index write failed; vector rollback completed",
+            }
+
+        except Exception as exc:
+            logger.error("Batch ingestion failed: %s", exc)
+            if v_success:
+                rollback_sources = set(
+                    chunk.metadata.get("source_file")
+                    or chunk.metadata.get("source_path")
+                    for chunk in chunks
+                )
+                for source_file in rollback_sources:
+                    if source_file:
+                        self._rollback_vector_write(collection_name, source_file)
 
             return {"status": "error", "message": f"Database write failed: {exc}"}

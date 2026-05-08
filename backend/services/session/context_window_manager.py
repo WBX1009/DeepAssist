@@ -2,11 +2,35 @@ import heapq
 import re
 from typing import Any, Dict, List
 
+# Token counting utilities for context budgeting
+try:
+    import tiktoken  # type: ignore
+
+    _TOKEN_ENCODER = tiktoken.get_encoding("cl100k_base")
+except Exception:
+    _TOKEN_ENCODER = None
+
 from backend.domain.entities.context_window import (
     ContextPriorityBand,
     ContextTurn,
     ContextWindowPlan,
 )
+
+
+def _count_tokens(text: str) -> int:
+    """
+    Estimate token count for the given text using tiktoken if available.
+    Fallback heuristics count CJK characters, words, and symbols as token-like units.
+    """
+    if _TOKEN_ENCODER:
+        try:
+            return len(_TOKEN_ENCODER.encode(text))
+        except Exception:
+            pass
+
+    # Conservative fallback: count CJK characters, words, and symbols
+    token_like_units = re.findall(r"[\u4e00-\u9fff]|[A-Za-z0-9_]+|[^\s]", text or "")
+    return len(token_like_units)
 
 
 class PriorityContextWindowManager:
@@ -26,6 +50,20 @@ class PriorityContextWindowManager:
     ):
         self.recent_turns_to_keep = recent_turns_to_keep
         self.max_overshoot_messages = max_overshoot_messages
+
+    def _count_tokens(self, text: str) -> int:
+        """
+        Estimate token count for the given text by delegating to the module-level function.
+        """
+        return _count_tokens(text)
+
+    def _estimate_message_tokens(self, message: Dict[str, Any]) -> int:
+        """
+        Estimate the token cost of a single chat message.
+        Currently counts tokens in the message content only.
+        """
+        content = str(message.get("content", ""))
+        return self._count_tokens(content)
 
     def plan(self, history: List[Dict[str, Any]], budget: int) -> ContextWindowPlan:
         safe_budget = max(0, budget)
@@ -103,7 +141,13 @@ class PriorityContextWindowManager:
                             turn_id=f"turn-{turn_index}",
                             started_at_index=current_start,
                             messages=current_messages,
-                            estimated_cost=len(current_messages),
+                            estimated_cost=max(
+                                1,
+                                sum(
+                                    self._estimate_message_tokens(msg)
+                                    for msg in current_messages
+                                ),
+                            ),
                         )
                     )
                     turn_index += 1
@@ -121,7 +165,13 @@ class PriorityContextWindowManager:
                     turn_id=f"turn-{turn_index}",
                     started_at_index=current_start,
                     messages=current_messages,
-                    estimated_cost=len(current_messages),
+                    estimated_cost=max(
+                        1,
+                        sum(
+                            self._estimate_message_tokens(msg)
+                            for msg in current_messages
+                        ),
+                    ),
                 )
             )
 

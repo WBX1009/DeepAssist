@@ -19,6 +19,7 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.append(str(PROJECT_ROOT))
 
+from backend.application.kb_app import KnowledgeBaseApp
 from backend.common.config import settings
 from backend.common.logger import get_logger
 from backend.domain.entities.document import DocumentChunk
@@ -341,6 +342,29 @@ def reset_file_state(
     keyword_db.delete_by_source(task.collection_name, source_file)
 
 
+def flush_batch(
+    collection_name: str,
+    chunks: List[DocumentChunk],
+    kb_app: KnowledgeBaseApp,
+) -> int:
+    """
+    Write a batch of DocumentChunks using the KnowledgeBaseApp ingestion pipeline.
+
+    This delegates embedding computation, vector write, keyword index write, and vector
+    rollback to the application layer.
+    """
+    if not chunks:
+        return 0
+
+    result = kb_app.process_chunks(collection_name, chunks)
+    if result.get("status") == "success":
+        return len(chunks)
+
+    raise RuntimeError(
+        f"Batch ingest failed for collection={collection_name}: {result.get('message')}"
+    )
+
+
 def ingest_file_to_db(
     task: IngestTask,
     embedding_model: BGEM3Local,
@@ -348,8 +372,11 @@ def ingest_file_to_db(
     keyword_db: WhooshStore,
     progress_mgr: ProgressManager,
     manifest_store: KnowledgeBaseManifestStore,
+    kb_app: KnowledgeBaseApp,
     batch_size: int = DEFAULT_BATCH_SIZE,
 ) -> None:
+    del embedding_model
+
     global SHUTDOWN_REQUESTED
 
     source_file = stable_source_file(task.path)
@@ -395,9 +422,7 @@ def ingest_file_to_db(
         inserted_chunks += flush_batch(
             task.collection_name,
             batch_chunks,
-            embedding_model,
-            vector_db,
-            keyword_db,
+            kb_app,
         )
         progress_mgr.save_index(progress_key, last_row_idx)
         progress.update(len(batch_chunks))
@@ -407,9 +432,7 @@ def ingest_file_to_db(
         inserted_chunks += flush_batch(
             task.collection_name,
             batch_chunks,
-            embedding_model,
-            vector_db,
-            keyword_db,
+            kb_app,
         )
         progress_mgr.save_index(progress_key, last_row_idx)
         progress.update(len(batch_chunks))
@@ -442,26 +465,6 @@ def ingest_file_to_db(
         inserted_chunks,
         total_chunk_count,
     )
-
-
-def flush_batch(
-    collection_name: str,
-    chunks: List[DocumentChunk],
-    embedding_model: BGEM3Local,
-    vector_db: ChromaStore,
-    keyword_db: WhooshStore,
-) -> int:
-    if not chunks:
-        return 0
-    texts = [chunk.content for chunk in chunks]
-    embeddings = embedding_model.embed_documents(texts)
-    vector_ok = vector_db.add_chunks(collection_name, chunks, embeddings)
-    keyword_ok = keyword_db.build_index(collection_name, chunks)
-    if not vector_ok or not keyword_ok:
-        raise RuntimeError(
-            f"Batch ingest failed for collection={collection_name} vector_ok={vector_ok} keyword_ok={keyword_ok}"
-        )
-    return len(chunks)
 
 
 def build_tasks() -> List[IngestTask]:
@@ -516,19 +519,30 @@ def main() -> None:
         MAX_SAMPLES_PER_FILE,
         DEFAULT_BATCH_SIZE,
     )
+
     embedding_model = BGEM3Local()
     vector_db = ChromaStore()
     keyword_db = WhooshStore()
     progress_mgr = ProgressManager(settings.INGEST_PROGRESS_PATH)
     manifest_store = KnowledgeBaseManifestStore(settings.KB_MANIFEST_PATH)
 
+    kb_app = KnowledgeBaseApp(
+        chunker=DocumentChunker(),
+        embedding_model=embedding_model,
+        vector_db=vector_db,
+        keyword_db=keyword_db,
+    )
+
     for task in build_tasks():
         if SHUTDOWN_REQUESTED:
             break
+
         logger.info("=" * 72)
+
         if not task.path.exists():
             logger.error("Source file is missing, skip: %s", task.path)
             continue
+
         ingest_file_to_db(
             task=task,
             embedding_model=embedding_model,
@@ -536,6 +550,7 @@ def main() -> None:
             keyword_db=keyword_db,
             progress_mgr=progress_mgr,
             manifest_store=manifest_store,
+            kb_app=kb_app,
             batch_size=DEFAULT_BATCH_SIZE,
         )
 
