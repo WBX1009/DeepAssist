@@ -9,9 +9,8 @@ from backend.domain.interfaces.reranker import BaseReranker
 @dataclass(frozen=True)
 class RerankerConfig:
     model_name: str = "lexical_overlap_fallback"
-    fused_score_weight: float = 0.3
-    lexical_score_weight: float = 0.7
-
+    fused_score_weight: float = 0.6  # 原来是 0.3，调高底层向量融合的权重
+    lexical_score_weight: float = 0.4 # 原来是 0.7，降低粗糙词法匹配的惩罚
 
 class NoOpReranker(BaseReranker):
     """Reranker placeholder that preserves first-stage order."""
@@ -136,4 +135,9 @@ class LexicalOverlapReranker(BaseReranker):
 
         if not doc_terms:
             return 0.0
-        return len(query_terms & doc_terms) / len(query_terms)
+            
+        # 🚀 核心修复：防止长句导致分母过大！
+        # 改用 命中词数 / min(提问词数, 文档词数)，或者直接使用更宽容的重合度
+        overlap_count = len(query_terms & doc_terms)
+        denominator = max(1, min(len(query_terms), len(doc_terms)))
+        return overlap_count / denominator

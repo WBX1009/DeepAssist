@@ -28,7 +28,7 @@ class ChatApplication:
         "\u8c22\u8c22|\u591a\u8c22|\u518d\u89c1|\u62dc\u62dc|bye)$",
         flags=re.IGNORECASE,
     )
-    _RAG_RELEVANCE_THRESHOLD = 0.35
+    _RAG_RELEVANCE_THRESHOLD = 0.1
     _EXPLICIT_KB_QUERY_PATTERN = re.compile(
         r"(根据|基于).*(知识库|文档|资料)|"
         r"(知识库|文档|资料).*(回答|作答|引用|依据|检索|查找)|"
