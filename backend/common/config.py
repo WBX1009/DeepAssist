@@ -35,6 +35,12 @@ class Settings(BaseSettings):
     # === [Agent配置] ===
     MAX_AGENT_STEPS: int = 10
 
+    # === [Tool Permissions] ===
+    # Comma-separated list of allowed tool categories. Available categories:
+    # read_only, write_file, network, code_exec, db_query.
+    # In production, code_exec is disabled by default.
+    ALLOWED_TOOL_CATEGORIES: str = "read_only,write_file,network,db_query"
+ 
     model_config = SettingsConfigDict(
         env_file=".env", 
         env_file_encoding="utf-8", 

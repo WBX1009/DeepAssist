@@ -1,5 +1,5 @@
 from functools import lru_cache
-from typing import Any, Callable, List, Optional
+from typing import Any, Callable, List, Optional, Dict
 
 from backend.application.agent_app import AgentApplication
 from backend.application.chat_app import ChatApplication
@@ -269,9 +269,36 @@ def _build_agent_tools(
 
 @lru_cache()
 def get_tool_registry() -> ToolRegistry:
+    # Build tool list
+    tools_list = _build_agent_tools(get_retriever(), get_rag_pipeline(), get_kb_app())
+    # Define categories for known tools
+    tool_categories: Dict[str, str] = {
+        "read_local_file": "read_only",
+        "list_sandbox_files": "read_only",
+        "write_local_file": "write_file",
+        "get_weather": "network",
+        "execute_python_code": "code_exec",
+        "query_business_database": "db_query",
+    }
+    # Assign default category for unlisted tools
+    for tool in tools_list:
+        name = getattr(tool, "__name__", None)
+        if name and name not in tool_categories:
+            tool_categories[name] = "read_only"
+    # Determine allowed categories from settings (comma-separated string)
+    try:
+        allowed_categories = set(
+            c.strip() for c in settings.ALLOWED_TOOL_CATEGORIES.split(",") if c.strip()
+        )
+    except Exception:
+        allowed_categories = None
+    policy = ToolPolicy(
+        max_result_chars=4000,
+        allowed_categories=allowed_categories,
+        tool_categories=tool_categories,
+    )   
     return ToolRegistry.from_callables(
-        tools=_build_agent_tools(get_retriever(), get_rag_pipeline(), get_kb_app()),
-        policy=ToolPolicy(max_result_chars=4000),
+        tools=tools_list, policy=policy
     )
 
 

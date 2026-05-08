@@ -32,10 +32,20 @@ class ToolPolicy:
     """Small governance layer for tool execution."""
 
     allowed_tools: Optional[Set[str]] = None
+    allowed_categories: Optional[Set[str]] = None
+    tool_categories: Optional[Dict[str, str]] = None
     max_result_chars: int = 4000
 
     def can_execute(self, tool_name: str) -> bool:
-        return self.allowed_tools is None or tool_name in self.allowed_tools
+        # Check specific tool whitelist first
+        if self.allowed_tools is not None and tool_name not in self.allowed_tools:
+            return False
+        # If category-based policy is active, verify category
+        if self.allowed_categories is not None and self.tool_categories:
+            category = self.tool_categories.get(tool_name)
+            if category is None or category not in self.allowed_categories:
+                return False
+        return True
 
     def apply_result_limits(self, result: ToolResult) -> ToolResult:
         if len(result.content) <= self.max_result_chars:
