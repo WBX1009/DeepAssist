@@ -54,8 +54,15 @@ class ChatWorker(BaseAgentWorker):
         )
         final_answer = ""
         for chunk in self.llm.chat_stream(context.messages, **self._model_options(model_options)):
-            final_answer += chunk
-            yield {"type": "message_delta", "content": chunk}
+            if isinstance(chunk, dict):
+                if chunk.get("type") == "reasoning":
+                    yield {"type": "reasoning", "content": chunk["content"]}
+                else:
+                    final_answer += chunk["content"]
+                    yield {"type": "message_delta", "content": chunk["content"]}
+            else:
+                final_answer += chunk
+                yield {"type": "message_delta", "content": chunk}
         yield {
             "type": "finish",
             "new_messages": [
@@ -452,8 +459,15 @@ class OrchestratorWorker(BaseAgentWorker):
         )
         final_answer = ""
         for chunk in self.llm.chat_stream(synthesis_messages, **self._model_options(model_options)):
-            final_answer += chunk
-            yield {"type": "message_delta", "content": chunk}
+            if isinstance(chunk, dict):
+                if chunk.get("type") == "reasoning":
+                    yield {"type": "reasoning", "content": chunk["content"]}
+                else:
+                    final_answer += chunk["content"]
+                    yield {"type": "message_delta", "content": chunk["content"]}
+            else:
+                final_answer += chunk
+                yield {"type": "message_delta", "content": chunk}
 
         yield {
             "type": "finish",

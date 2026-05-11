@@ -35,10 +35,6 @@ class RetrievalConfig:
 
 
 class HybridRetriever:
-    """Hybrid retriever with weighted RRF, graceful degradation, and trace metadata."""
-
-    _LOW_RELEVANCE_THRESHOLD = 0.35
-
     def __init__(
         self,
         vector_db: BaseVectorDB,
@@ -54,6 +50,7 @@ class HybridRetriever:
         self.config = config or RetrievalConfig()
         self.query_planner = query_planner or QueryPlanner()
         self.reranker = reranker or LexicalOverlapReranker()
+        self._LOW_RELEVANCE_THRESHOLD = settings.RAG_LOW_RELEVANCE_THRESHOLD
 
     def retrieve(
         self,

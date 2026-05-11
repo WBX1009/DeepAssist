@@ -1,5 +1,5 @@
 import asyncio
-import re
+import json
 from typing import Iterator, Optional, Tuple
 
 from backend.common.logger import get_logger
@@ -16,25 +16,10 @@ from backend.services.streaming.sse_manager import SSEManager
 
 logger = get_logger(__name__)
 
-
 class ChatApplication:
     """Chat workflow orchestrator for quick chat and RAG chat modes."""
 
-    _SMALL_TALK_PATTERN = re.compile(
-        "^(hi|hello|hey|yo|"
-        "\u4f60\u597d|\u60a8\u597d|\u55e8|\u54c8\u55bd|"
-        "\u5728\u5417|\u5728\u4e0d\u5728|"
-        "\u65e9\u4e0a\u597d|\u4e0a\u5348\u597d|\u4e2d\u5348\u597d|\u4e0b\u5348\u597d|\u665a\u4e0a\u597d|"
-        "\u8c22\u8c22|\u591a\u8c22|\u518d\u89c1|\u62dc\u62dc|bye)$",
-        flags=re.IGNORECASE,
-    )
     _RAG_RELEVANCE_THRESHOLD = 0.1
-    _EXPLICIT_KB_QUERY_PATTERN = re.compile(
-        r"(根据|基于).*(知识库|文档|资料)|"
-        r"(知识库|文档|资料).*(回答|作答|引用|依据|检索|查找)|"
-        r"(请).*(引用|标注)\s*",
-        flags=re.IGNORECASE,
-    )
 
     def __init__(
         self,
@@ -63,6 +48,43 @@ class ChatApplication:
     def delete_session(self, session_id: str) -> bool:
         return self.session_mgr.delete_session(session_id)
 
+    def _analyze_query_intent(self, query: str) -> dict:
+        """🌟 核心改造：使用 LLM 替代传统正则表达式进行查询意图分析"""
+        default_intent = {"is_small_talk": False, "is_explicit_kb": False, "is_negative_kb": False}
+        if not query.strip():
+            return default_intent
+
+        system_prompt = (
+            "你是一个自然语言理解引擎。你的任务是分析用户的输入，并输出纯JSON对象，包含以下三个布尔值字段：\n"
+            "1. is_small_talk: 用户是否仅仅在进行日常问候、告别或简单闲聊（如“你好”、“在吗”、“拜拜”、“谢谢”）。如果包含实质性提问，设为 false。\n"
+            "2. is_explicit_kb: 用户是否明确要求根据“知识库”、“文档”、“资料”或“参考”来回答。\n"
+            "3. is_negative_kb: 用户是否明确要求【不要】查知识库、不查资料或不查数据库。\n"
+            "请注意：只返回JSON，不要包含任何Markdown标记（如```json）或其他说明文字。"
+        )
+        messages =[
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": query}
+        ]
+        
+        try:
+            response = self.llm.chat(messages, temperature=0.0)
+            content = response.content.strip()
+            
+            if content.startswith("```json"):
+                content = content[7:-3].strip()
+            elif content.startswith("```"):
+                content = content[3:-3].strip()
+            
+            result = json.loads(content)
+            return {
+                "is_small_talk": bool(result.get("is_small_talk", False)),
+                "is_explicit_kb": bool(result.get("is_explicit_kb", False)),
+                "is_negative_kb": bool(result.get("is_negative_kb", False)),
+            }
+        except Exception as exc:
+            logger.error(f"LLM query intent analysis failed: {exc}")
+            return default_intent
+
     def stream_chat(
         self,
         session_id: str,
@@ -76,17 +98,27 @@ class ChatApplication:
         use_user_memory: bool = False,
     ) -> Iterator[str]:
         full_response = ""
-        response_chunks: list[str] = []
+        response_chunks: list[str] =[]
         should_persist = False
         history_budget = max(1, history_rounds)
         try:
             mode, intent_decision = self._resolve_mode(mode, query)
+            
+            query_intent = self._analyze_query_intent(query)
+
             if intent_decision:
                 yield SSEManager.format_event(
                     StreamEvent.status(
                         f"Auto-routed to {mode} ({intent_decision.reason}, confidence={intent_decision.confidence:.2f})"
                     )
                 )
+
+            if mode == "rag" and query_intent.get("is_negative_kb"):
+                logger.info("User explicitly requested to bypass KB in session %s", session_id)
+                yield SSEManager.format_event(
+                    StreamEvent.status("已识别到不查阅知识库的指令；自动切换至快速对话模式。")
+                )
+                mode = "quick"
 
             if mode == "quick":
                 logger.info("Entering quick chat mode")
@@ -132,7 +164,8 @@ class ChatApplication:
 
             if mode == "rag":
                 logger.info("Entering RAG chat mode for session %s", session_id)
-                if self._is_small_talk_query(query):
+                
+                if query_intent.get("is_small_talk"):
                     logger.info("Bypassing RAG retrieval for small-talk query in session %s", session_id)
                     yield SSEManager.format_event(
                         StreamEvent.status(
@@ -231,7 +264,8 @@ class ChatApplication:
                         )
                     )
 
-                rag_decision = self._decide_rag_fallback(query, pipeline_result)
+                rag_decision = self._decide_rag_fallback(pipeline_result, query_intent.get("is_explicit_kb", False))
+                
                 if rag_decision["action"] == "direct_kb_miss":
                     logger.info(
                         "RAG retrieval is insufficient for explicit KB query in session %s",
@@ -273,12 +307,24 @@ class ChatApplication:
                     yield SSEManager.format_event(StreamEvent.status(rag_decision["status"]))
 
                 should_persist = True
-                rag_answer = self._collect_llm_response(
+                
+                rag_answer_chunks =[]
+                for chunk in self.llm.chat_stream(
                     context.messages,
                     model_name=model_name,
                     temperature=temperature,
                     top_p=top_p,
-                )
+                ):
+                    if isinstance(chunk, dict):
+                        if chunk.get("type") == "reasoning":
+                            yield SSEManager.format_event(StreamEvent.reasoning(chunk["content"]))
+                        else:
+                            rag_answer_chunks.append(chunk["content"])
+                    else:
+                        rag_answer_chunks.append(chunk)
+
+                rag_answer = "".join(rag_answer_chunks)
+
                 if context.rag_context_pack:
                     guard_report = self.rag_pipeline.check_answer(
                         rag_answer,
@@ -290,8 +336,8 @@ class ChatApplication:
                     rag_answer = self._apply_rag_guard_action(
                         answer=rag_answer,
                         guard_report=guard_report,
-                        query=query,
                         pipeline_result=pipeline_result,
+                        is_explicit_kb=query_intent.get("is_explicit_kb", False)
                     )
                 full_response = rag_answer
                 yield from self._emit_buffered_text(full_response, response_chunks)
@@ -352,8 +398,15 @@ class ChatApplication:
             temperature=temperature,
             top_p=top_p,
         ):
-            response_chunks.append(chunk)
-            yield SSEManager.format_event(StreamEvent.message_delta(chunk))
+            if isinstance(chunk, dict):
+                if chunk.get("type") == "reasoning":
+                    yield SSEManager.format_event(StreamEvent.reasoning(chunk["content"]))
+                else:
+                    response_chunks.append(chunk["content"])
+                    yield SSEManager.format_event(StreamEvent.message_delta(chunk["content"]))
+            else:
+                response_chunks.append(chunk)
+                yield SSEManager.format_event(StreamEvent.message_delta(chunk))
 
     def _collect_llm_response(
         self,
@@ -362,14 +415,18 @@ class ChatApplication:
         temperature: Optional[float] = None,
         top_p: Optional[float] = None,
     ) -> str:
-        chunks: list[str] = []
+        chunks: list[str] =[]
         for chunk in self.llm.chat_stream(
             messages,
             model_name=model_name,
             temperature=temperature,
             top_p=top_p,
         ):
-            chunks.append(chunk)
+            if isinstance(chunk, dict):
+                if chunk.get("type") != "reasoning":
+                    chunks.append(chunk["content"])
+            else:
+                chunks.append(chunk)
         return "".join(chunks)
 
     def _emit_buffered_text(
@@ -385,10 +442,6 @@ class ChatApplication:
             response_chunks.append(chunk)
             yield SSEManager.format_event(StreamEvent.message_delta(chunk))
 
-    def _is_small_talk_query(self, query: str) -> bool:
-        normalized = re.sub(r"\s+", "", query or "").strip().lower()
-        return bool(normalized and self._SMALL_TALK_PATTERN.fullmatch(normalized))
-
     def _should_fallback_from_rag(self, pipeline_result) -> bool:
         documents = pipeline_result.retrieval_result.documents
         if not documents:
@@ -397,7 +450,7 @@ class ChatApplication:
         best_score = documents[0].score or 0.0
         return best_score < self._RAG_RELEVANCE_THRESHOLD
 
-    def _decide_rag_fallback(self, query: str, pipeline_result) -> dict:
+    def _decide_rag_fallback(self, pipeline_result, is_explicit_kb: bool) -> dict:
         diagnostics = (
             pipeline_result.retrieval_result.metadata.get("diagnostics", {})
             if pipeline_result.retrieval_result.metadata
@@ -405,7 +458,6 @@ class ChatApplication:
         )
         reason_code = diagnostics.get("reason_code", "ok")
         reason_message = diagnostics.get("reason_message", "retrieval_ready")
-        explicit_kb_query = self._is_explicit_kb_query(query)
 
         if reason_code in {"all_channels_failed"}:
             return {
@@ -414,7 +466,7 @@ class ChatApplication:
             }
 
         if reason_code in {"no_hits", "low_relevance"}:
-            if explicit_kb_query:
+            if is_explicit_kb:
                 return {
                     "action": "direct_kb_miss",
                     "status": "The knowledge-base retrieval result is insufficient for a source-grounded answer.",
@@ -433,10 +485,6 @@ class ChatApplication:
 
         return {"action": "proceed", "status": ""}
 
-    def _is_explicit_kb_query(self, query: str) -> bool:
-        normalized = " ".join((query or "").split())
-        return bool(normalized and self._EXPLICIT_KB_QUERY_PATTERN.search(normalized))
-
     def _render_kb_miss_answer(self, reason_message: str) -> str:
         return (
             "根据当前知识库检索，暂时没有找到足够相关、可直接支撑答案的资料。"
@@ -448,14 +496,14 @@ class ChatApplication:
         self,
         answer: str,
         guard_report,
-        query: str,
         pipeline_result,
+        is_explicit_kb: bool,
     ) -> str:
         if guard_report.grounded:
             return answer
 
         if guard_report.recommended_action == "fallback_without_kb_claims":
-            if self._is_explicit_kb_query(query):
+            if is_explicit_kb:
                 return self._render_kb_miss_answer(guard_report.reason)
             return (
                 f"{answer}\n\n"

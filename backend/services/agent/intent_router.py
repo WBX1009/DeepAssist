@@ -1,119 +1,107 @@
-import re
+import json
+from functools import lru_cache
 from typing import Iterable, Optional, Set
 
+from backend.common.logger import get_logger
 from backend.domain.entities.intent import IntentDecision, IntentType
+from backend.domain.interfaces.llm import BaseLLM
 
+logger = get_logger(__name__)
 
 class IntentRouter:
-    """Lightweight deterministic intent router for workflow selection."""
+    """LLM-based deterministic intent router for workflow selection."""
 
-    TOOL_INVENTORY_PATTERNS = (
-        r"能调用哪些工具",
-        r"(哪些|什么).*(工具)",
-        r"(工具).*(有哪些|列表|清单|可用|支持|能调用|可调用)",
-    )
-    KB_CATALOG_PATTERNS = (
-        r"(当前|现在|目前).*(知识库|集合|文档|文件)",
-        r"(知识库|集合|文档|文件).*(有哪些|有多少|多少个|列表|清单|状态|上传|接入)",
-        r"(能|可以).*(根据|基于).*(知识库).*(回答|作答|问答)",
-        r"(知识库).*(能|可以).*(回答|作答|问答)",
-    )
+    def __init__(self, llm: BaseLLM):
+        self.llm = llm
 
-    RAG_PATTERNS = (
-        "\u77e5\u8bc6\u5e93",  # knowledge base
-        "\u6587\u6863",  # document
-        "\u8d44\u6599",  # material
-        "\u53c2\u8003",  # reference
-        "\u68c0\u7d22",  # retrieval/search
-        "\u6839\u636e.*(\u5185\u5bb9|\u8d44\u6599|\u6587\u6863)",  # according to content/material/doc
-        r"rag",
-        r"chunk",
-        "\u5411\u91cf",  # vector
-        "\u53ec\u56de",  # recall
-        "\u7d22\u5f15",  # index
-    )
-    AGENT_PATTERNS = (
-        "\u6267\u884c",  # execute
-        "\u8fd0\u884c",  # run
-        "\u8c03\u7528",  # call
-        "\u5de5\u5177",  # tool
-        "\u5199\u5165",  # write
-        "\u521b\u5efa.*\u6587\u4ef6",  # create file
-        "\u8bfb\u53d6.*\u6587\u4ef6",  # read file
-        "\u67e5\u5929\u6c14",  # check weather
-        "\u5929\u6c14",  # weather
-        r"sql",
-        "\u6570\u636e\u5e93",  # database
-        "\u8ba1\u7b97",  # calculate
-        "\u751f\u6210.*\u62a5\u544a",  # generate report
-        "\u5b8c\u6210.*\u4efb\u52a1",  # complete task
-        "\u5206\u6b65\u9aa4",  # step by step
-    )
+    @lru_cache(maxsize=32)
+    def _analyze_intent(self, query: str) -> dict:
+        """🌟 核心改造：统一使用 LLM 进行意图识别，加 lru_cache 防止同一次请求被多次重复分析"""
+        default_result = {
+            "intent": "chat",
+            "confidence": 0.4,
+            "reason": "fallback to default chat",
+            "is_tool_inventory": False,
+            "is_kb_catalog": False
+        }
+        if not query.strip():
+            return default_result
+
+        system_prompt = (
+            "你是一个底层的意图路由引擎。你的任务是分析用户的输入，并将其精确分类。\n"
+            "请输出纯JSON对象，必须包含以下5个字段：\n"
+            "1. intent (字符串): 必须是 'chat', 'rag', 'agent' 之一。\n"
+            "   - agent: 用户指令需要调用外部工具、执行代码、操作文件、查天气、查数据库等复杂动作。\n"
+            "   - rag: 用户明确需要检索知识库、文档、参考资料以获取长文本支撑的专业问答。\n"
+            "   - chat: 常规问候、闲聊、基础常识，无需外部检索和工具。\n"
+            "   注意：如果用户明确指定“不要查资料”或包含拒绝查库的负面指令，绝对不能输出 'rag'。\n"
+            "2. confidence (浮点数): 0.0 到 1.0 之间的置信度。\n"
+            "3. reason (字符串): 做出该判断的简短理由。\n"
+            "4. is_tool_inventory (布尔值): 用户是否在专门询问“系统具备哪些工具/能调用什么工具”。\n"
+            "5. is_kb_catalog (布尔值): 用户是否在专门询问“系统连接了哪些知识库/文档列表/集合状态”。\n\n"
+            "请直接返回 JSON 格式，不要包含 ```json 等 Markdown 标记及任何其他说明文字。"
+        )
+
+        messages =[
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": query}
+        ]
+
+        try:
+            # 使用 temperature=0.0 保证分类的确定性和稳定性
+            response = self.llm.chat(messages, temperature=0.0)
+            content = response.content.strip()
+
+            # 清洗大模型可能附带的 Markdown 标记
+            if content.startswith("```json"):
+                content = content[7:-3].strip()
+            elif content.startswith("```"):
+                content = content[3:-3].strip()
+
+            result = json.loads(content)
+            
+            # 安全兜底校验
+            if result.get("intent") not in {"chat", "rag", "agent"}:
+                result["intent"] = "chat"
+                
+            return result
+        except Exception as exc:
+            logger.error(f"LLM intent routing failed: {exc}")
+            return default_result
 
     def route(
         self,
         query: str,
         allowed_intents: Optional[Iterable[IntentType]] = None,
     ) -> IntentDecision:
-        text = query.strip().lower()
         allowed: Set[IntentType] = set(allowed_intents or IntentType)
-
-        if not text:
-            return self._coerce(
-                IntentDecision(
-                    intent=IntentType.CHAT,
-                    confidence=0.4,
-                    reason="empty query defaults to chat",
-                    signals=[],
-                ),
-                allowed,
-            )
-
-        rag_hits = self._match_patterns(text, self.RAG_PATTERNS)
-        agent_hits = self._match_patterns(text, self.AGENT_PATTERNS)
-
-        if agent_hits and len(agent_hits) >= len(rag_hits):
-            return self._coerce(
-                IntentDecision(
-                    intent=IntentType.AGENT,
-                    confidence=min(0.9, 0.55 + 0.1 * len(agent_hits)),
-                    reason="tool/action signals detected",
-                    signals=agent_hits,
-                ),
-                allowed,
-            )
-
-        if rag_hits:
-            return self._coerce(
-                IntentDecision(
-                    intent=IntentType.RAG,
-                    confidence=min(0.85, 0.55 + 0.08 * len(rag_hits)),
-                    reason="knowledge retrieval signals detected",
-                    signals=rag_hits,
-                ),
-                allowed,
-            )
-
-        return self._coerce(
-            IntentDecision(
-                intent=IntentType.CHAT,
-                confidence=0.6,
-                reason="no retrieval or tool signals detected",
-                signals=[],
-            ),
-            allowed,
+        
+        # 将会命中同一次请求的 lru_cache
+        analysis = self._analyze_intent(query)
+        
+        intent_str = analysis.get("intent", "chat")
+        intent_val = IntentType.CHAT
+        if intent_str == "rag":
+            intent_val = IntentType.RAG
+        elif intent_str == "agent":
+            intent_val = IntentType.AGENT
+            
+        decision = IntentDecision(
+            intent=intent_val,
+            confidence=float(analysis.get("confidence", 0.6)),
+            reason=str(analysis.get("reason", "LLM based intent routing")),
+            signals=[f"llm_routed_{intent_str}"]
         )
 
+        return self._coerce(decision, allowed)
+
     def is_tool_inventory_query(self, query: str) -> bool:
-        text = (query or "").strip().lower()
-        return bool(text and self._match_patterns(text, self.TOOL_INVENTORY_PATTERNS))
+        analysis = self._analyze_intent(query)
+        return bool(analysis.get("is_tool_inventory", False))
 
     def is_kb_catalog_query(self, query: str) -> bool:
-        text = (query or "").strip().lower()
-        return bool(text and self._match_patterns(text, self.KB_CATALOG_PATTERNS))
-
-    def _match_patterns(self, text: str, patterns: Iterable[str]) -> list[str]:
-        return [pattern for pattern in patterns if re.search(pattern, text, flags=re.IGNORECASE)]
+        analysis = self._analyze_intent(query)
+        return bool(analysis.get("is_kb_catalog", False))
 
     def _coerce(self, decision: IntentDecision, allowed: Set[IntentType]) -> IntentDecision:
         if decision.intent in allowed:

@@ -165,7 +165,6 @@ class SQLiteMemoryStore(BaseMemoryStore):
         try:
             with self._get_connection() as conn:
                 cursor = conn.cursor()
-                # 按 session_id 分组，获取最早的一条作为标题，最晚的时间作为排序依据
                 cursor.execute("""
                     SELECT session_id, MIN(created_at) as start_time, MAX(created_at) as last_time
                     FROM messages
@@ -173,27 +172,26 @@ class SQLiteMemoryStore(BaseMemoryStore):
                     ORDER BY last_time DESC
                 """)
                 rows = cursor.fetchall()
-                
+
                 sessions =[]
                 for row in rows:
                     s_id = row[0]
                     last_time = row[2]
-                    
-                    # 获取该 session 的第一条用户发言作为标题
+
+                    # 🚀 修复点：ORDER BY id 确保真正的时序
                     cursor.execute("""
-                        SELECT content FROM messages 
-                        WHERE session_id = ? AND role = 'user' 
-                        ORDER BY created_at ASC LIMIT 1
+                        SELECT content FROM messages
+                        WHERE session_id = ? AND role = 'user'
+                        ORDER BY id ASC LIMIT 1
                     """, (s_id,))
                     title_row = cursor.fetchone()
-                    
+
                     title = "新对话"
                     if title_row and title_row[0]:
-                        # 截取前 15 个字符作为展示标题
                         title = title_row[0][:15].replace('\n', ' ')
                         if len(title_row[0]) > 15:
                             title += "..."
-                            
+
                     sessions.append({
                         "session_id": s_id,
                         "title": title,
@@ -202,7 +200,7 @@ class SQLiteMemoryStore(BaseMemoryStore):
                 return sessions
         except Exception as e:
             logger.error(f"获取会话列表失败: {e}")
-            return[]          
+            return[]
 
     def get_profile(self, key: str) -> Optional[str]:
         try:

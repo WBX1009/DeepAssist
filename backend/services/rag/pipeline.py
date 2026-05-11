@@ -1,3 +1,4 @@
+from backend.common.config import settings
 from backend.domain.entities.answer import AnswerGroundingReport
 from backend.domain.entities.rag_pipeline import RAGPipelineResult
 from backend.domain.entities.retrieval import RetrievalChannelTrace, RetrievalResult
@@ -120,7 +121,7 @@ class RAGPipeline:
             reason_code = "no_hits"
             reason_message = "no_documents_retrieved_across_any_collection"
             suggested_action = "fallback_to_chat"
-        elif (best_score or 0.0) < diagnostics.get("low_relevance_threshold", 0.35):
+        elif (best_score or 0.0) < diagnostics.get("low_relevance_threshold", settings.RAG_LOW_RELEVANCE_THRESHOLD):
             reason_code = "low_relevance"
             reason_message = "top_cross_collection_document_score_below_threshold"
             suggested_action = "fallback_to_chat"
