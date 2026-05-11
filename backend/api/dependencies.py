@@ -57,16 +57,13 @@ from backend.common.config import settings
 
 logger = get_logger(__name__)
 
-
 # -----------------------------------------------------------------------------
-# Infrastructure adapters
+# Infrastructure adapters (Heavy, MUST be cached)
 # -----------------------------------------------------------------------------
-
 
 @lru_cache()
 def get_llm() -> BaseLLM:
     return DeepSeekClient()
-
 
 @lru_cache()
 def get_embedding_model() -> Optional[BaseEmbedding]:
@@ -76,7 +73,6 @@ def get_embedding_model() -> Optional[BaseEmbedding]:
         logger.warning("Embedding model initialization failed: %s", exc)
         return None
 
-
 @lru_cache()
 def get_vector_db() -> Optional[BaseVectorDB]:
     try:
@@ -84,7 +80,6 @@ def get_vector_db() -> Optional[BaseVectorDB]:
     except Exception as exc:
         logger.warning("Vector DB initialization failed: %s", exc)
         return None
-
 
 @lru_cache()
 def get_keyword_db() -> Optional[BaseKeywordDB]:
@@ -94,11 +89,9 @@ def get_keyword_db() -> Optional[BaseKeywordDB]:
         logger.warning("Keyword DB initialization failed: %s", exc)
         return None
 
-
 @lru_cache()
 def get_memory_store() -> BaseMemoryStore:
     return SQLiteMemoryStore()
-
 
 @lru_cache()
 def get_vector_index_health_inspector() -> VectorIndexHealthInspector:
@@ -109,51 +102,41 @@ def get_vector_index_health_inspector() -> VectorIndexHealthInspector:
         embedding_model=get_embedding_model(),
     )
 
-
 # -----------------------------------------------------------------------------
-# RAG service graph
+# RAG service graph (Lightweight, Recreated per request if dependent on dynamic config)
 # -----------------------------------------------------------------------------
-
 
 @lru_cache()
 def get_reranker() -> LexicalOverlapReranker:
     return LexicalOverlapReranker()
 
-
 @lru_cache()
 def get_context_packer() -> ContextPacker:
     return ContextPacker()
-
 
 @lru_cache()
 def get_answer_guard() -> SourceAwareResponseGuard:
     return SourceAwareResponseGuard()
 
-
-@lru_cache()
 def get_query_rewriter() -> QueryRewriteService:
-    """每次请求都创建新的重写器，避免 lru_cache 缓存旧逻辑。"""
+    """🌟 修复：不再使用 lru_cache，保证读取最新 settings 并构建新实例"""
     return QueryRewriteService(
-        config=QueryRewriteConfig(enable_llm_rewrite=True),
+        config=QueryRewriteConfig(enable_llm_rewrite=settings.ENABLE_LLM_REWRITE),
         llm=get_llm(),
     )
 
-
-@lru_cache()
 def get_query_planner() -> QueryPlanner:
+    """🌟 修复：伴随 Rewriter 实时生成"""
     return QueryPlanner(query_rewriter=get_query_rewriter())
 
-
-@lru_cache()
 def get_retriever() -> Optional[HybridRetriever]:
+    """🌟 修复：不再缓存，确保 RAG 链路使用最新配置的 Planner"""
     embedding_model = get_embedding_model()
     vector_db = get_vector_db()
     keyword_db = get_keyword_db()
 
     if not embedding_model or not vector_db or not keyword_db:
-        logger.warning(
-            "RAG retriever is unavailable because one or more adapters failed to initialize."
-        )
+        logger.warning("RAG retriever is unavailable because one or more adapters failed to initialize.")
         return None
 
     return HybridRetriever(
@@ -164,8 +147,6 @@ def get_retriever() -> Optional[HybridRetriever]:
         reranker=get_reranker(),
     )
 
-
-@lru_cache()
 def get_rag_pipeline() -> Optional[RAGPipeline]:
     retriever = get_retriever()
     if retriever is None:
@@ -177,11 +158,9 @@ def get_rag_pipeline() -> Optional[RAGPipeline]:
         answer_guard=get_answer_guard(),
     )
 
-
 # -----------------------------------------------------------------------------
-# Core services
+# Core services (Stateless Singletons)
 # -----------------------------------------------------------------------------
-
 
 @lru_cache()
 def get_session_manager() -> SessionManager:
@@ -192,36 +171,29 @@ def get_session_manager() -> SessionManager:
         memory_recall=get_long_term_memory_recall_service(),
     )
 
-
 @lru_cache()
 def get_context_window_manager() -> PriorityContextWindowManager:
     return PriorityContextWindowManager()
-
 
 @lru_cache()
 def get_summary_compressor() -> ConversationSummaryCompressor:
     return ConversationSummaryCompressor()
 
-
 @lru_cache()
 def get_long_term_memory_recall_service() -> LongTermMemoryRecallService:
     return LongTermMemoryRecallService(get_memory_store())
-
 
 @lru_cache()
 def get_context_engine() -> ContextEngine:
     return ContextEngine()
 
-
 @lru_cache()
 def get_intent_router() -> IntentRouter:
     return IntentRouter(llm=get_llm())
 
-
 @lru_cache()
 def get_task_decomposer() -> TaskDecomposer:
     return TaskDecomposer()
-
 
 @lru_cache()
 def get_profile_extractor() -> ProfileExtractor:
@@ -232,18 +204,16 @@ def get_profile_extractor() -> ProfileExtractor:
     )
     return extractor
 
-
 # -----------------------------------------------------------------------------
-# Agent assembly
+# Agent assembly (Dynamic due to tool binding)
 # -----------------------------------------------------------------------------
-
 
 def _build_agent_tools(
     retriever: Optional[HybridRetriever],
     rag_pipeline: Optional[RAGPipeline],
     kb_app: KnowledgeBaseApp,
 ) -> List[Callable[..., Any]]:
-    tools: List[Callable[..., Any]] = [
+    tools: List[Callable[..., Any]] =[
         read_local_file,
         write_local_file,
         list_sandbox_files,
@@ -252,8 +222,7 @@ def _build_agent_tools(
         query_business_database,
     ]
     kb_catalog_tool = KnowledgeBaseCatalogTool(kb_app)
-    tools.extend(
-        [
+    tools.extend([
             kb_catalog_tool.list_knowledge_base_collections,
             kb_catalog_tool.list_knowledge_base_files,
         ]
@@ -270,12 +239,9 @@ def _build_agent_tools(
 
     return tools
 
-
-@lru_cache()
 def get_tool_registry() -> ToolRegistry:
-    # Build tool list
+    # Build tool list dynamically
     tools_list = _build_agent_tools(get_retriever(), get_rag_pipeline(), get_kb_app())
-    # Define categories for known tools
     tool_categories: Dict[str, str] = {
         "read_local_file": "read_only",
         "list_sandbox_files": "read_only",
@@ -284,37 +250,30 @@ def get_tool_registry() -> ToolRegistry:
         "execute_python_code": "code_exec",
         "query_business_database": "db_query",
     }
-    # Assign default category for unlisted tools
     for tool in tools_list:
         name = getattr(tool, "__name__", None)
         if name and name not in tool_categories:
             tool_categories[name] = "read_only"
-    # Determine allowed categories from settings (comma-separated string)
     try:
         allowed_categories = set(
             c.strip() for c in settings.ALLOWED_TOOL_CATEGORIES.split(",") if c.strip()
         )
     except Exception:
         allowed_categories = None
+        
     policy = ToolPolicy(
         max_result_chars=4000,
         allowed_categories=allowed_categories,
         tool_categories=tool_categories,
-    )   
-    return ToolRegistry.from_callables(
-        tools=tools_list, policy=policy
     )
+    return ToolRegistry.from_callables(tools=tools_list, policy=policy)
 
-
-@lru_cache()
 def get_agent_engine() -> AgentEngine:
     return AgentEngine(
         llm=get_llm(),
         tool_registry=get_tool_registry(),
     )
 
-
-@lru_cache()
 def get_agent_supervisor() -> AgentSupervisor:
     llm = get_llm()
     context_engine = get_context_engine()
@@ -350,15 +309,12 @@ def get_agent_supervisor() -> AgentSupervisor:
         task_decomposer=get_task_decomposer(),
     )
 
-
 # -----------------------------------------------------------------------------
-# Application workflows
+# Application workflows (Request Scoped)
 # -----------------------------------------------------------------------------
 
-
-@lru_cache()
 def get_chat_app() -> ChatApplication:
-    get_profile_extractor()
+    """🌟 修复：不再缓存应用实例，以接收最新的下层依赖树"""
     return ChatApplication(
         llm=get_llm(),
         session_manager=get_session_manager(),
@@ -369,18 +325,14 @@ def get_chat_app() -> ChatApplication:
         rag_pipeline=get_rag_pipeline(),
     )
 
-
-@lru_cache()
 def get_agent_app() -> AgentApplication:
-    profile_extractor = get_profile_extractor()
     return AgentApplication(
         agent_engine=get_agent_engine(),
         session_manager=get_session_manager(),
         context_engine=get_context_engine(),
-        profile_extractor=profile_extractor,
+        profile_extractor=get_profile_extractor(),
         supervisor=get_agent_supervisor(),
     )
-
 
 @lru_cache()
 def get_kb_app() -> KnowledgeBaseApp:
@@ -392,8 +344,6 @@ def get_kb_app() -> KnowledgeBaseApp:
         health_inspector=get_vector_index_health_inspector(),
     )
 
-
-@lru_cache()
 def get_runtime_app() -> RuntimeApplication:
     return RuntimeApplication(
         kb_app=get_kb_app(),

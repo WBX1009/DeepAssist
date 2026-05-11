@@ -19,7 +19,6 @@ RECOVERY_QUERY_PATTERN = re.compile(
     flags=re.IGNORECASE,
 )
 
-
 class AgentApplication:
     """Agent workflow orchestrator."""
 
@@ -133,7 +132,7 @@ class AgentApplication:
                                 "intent": event.get("intent"),
                                 "confidence": event.get("confidence"),
                                 "reason": event.get("reason"),
-                                "signals": event.get("signals", []),
+                                "signals": event.get("signals",[]),
                             },
                         )
                     )

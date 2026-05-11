@@ -12,7 +12,6 @@ from backend.services.rag.pipeline import RAGPipeline
 
 logger = get_logger(__name__)
 
-
 class BaseAgentWorker:
     worker_type: AgentWorkerType
 
@@ -30,7 +29,6 @@ class BaseAgentWorker:
         if not model_options:
             return {}
         return {key: value for key, value in model_options.items() if value is not None}
-
 
 class ChatWorker(BaseAgentWorker):
     worker_type = AgentWorkerType.CHAT
@@ -65,16 +63,14 @@ class ChatWorker(BaseAgentWorker):
                 yield {"type": "message_delta", "content": chunk}
         yield {
             "type": "finish",
-            "new_messages": [
+            "new_messages":[
                 {"role": "assistant", "content": final_answer},
             ],
             "worker": self.worker_type.value,
         }
 
-
 class RAGWorker(BaseAgentWorker):
     worker_type = AgentWorkerType.RAG
-    _RAG_RELEVANCE_THRESHOLD = 0.1
     _EXPLICIT_KB_QUERY_PATTERN = re.compile(
         r"(根据|基于).*(知识库|文档|资料)|"
         r"(知识库|文档|资料).*(回答|作答|引用|依据|检索|查找)|"
@@ -133,7 +129,7 @@ class RAGWorker(BaseAgentWorker):
                     "grounded": False,
                     "recommended_action": "fallback_without_kb_claims",
                     "reason": "explicit_kb_query_without_reliable_support",
-                    "warnings": ["retrieval_insufficient_for_kb_answer"],
+                    "warnings":["retrieval_insufficient_for_kb_answer"],
                 },
             }
             yield {
@@ -161,9 +157,17 @@ class RAGWorker(BaseAgentWorker):
                 "content": rag_decision["status"],
             }
 
-        final_answer = "".join(
-            self.llm.chat_stream(context.messages, **self._model_options(model_options))
-        )
+        final_answer_chunks =[]
+        for chunk in self.llm.chat_stream(context.messages, **self._model_options(model_options)):
+            if isinstance(chunk, dict):
+                if chunk.get("type") == "reasoning":
+                    yield {"type": "reasoning", "content": chunk["content"]}
+                else:
+                    final_answer_chunks.append(chunk["content"])
+            else:
+                final_answer_chunks.append(chunk)
+
+        final_answer = "".join(final_answer_chunks)
 
         guard_report = self.rag_pipeline.check_answer(final_answer, pipeline_result)
         final_answer = self._apply_rag_guard_action(
@@ -177,17 +181,11 @@ class RAGWorker(BaseAgentWorker):
         yield {"type": "answer_guard", "data": guard_report.to_stream_data()}
         yield {
             "type": "finish",
-            "new_messages": [
+            "new_messages":[
                 {"role": "assistant", "content": final_answer},
             ],
             "worker": self.worker_type.value,
         }
-
-    def _should_fallback_to_chat(self, pipeline_result) -> bool:
-        documents = pipeline_result.retrieval_result.documents
-        if not documents:
-            return True
-        return (documents[0].score or 0.0) < self._RAG_RELEVANCE_THRESHOLD
 
     def _decide_rag_fallback(self, query: str, pipeline_result) -> Dict[str, str]:
         diagnostics = (
@@ -273,7 +271,6 @@ class RAGWorker(BaseAgentWorker):
             return []
         return [text[index : index + chunk_size] for index in range(0, len(text), chunk_size)]
 
-
 class ToolAgentWorker(BaseAgentWorker):
     worker_type = AgentWorkerType.TOOL
 
@@ -292,7 +289,7 @@ class ToolAgentWorker(BaseAgentWorker):
         yield {"type": "status", "content": "Supervisor selected ToolAgentWorker"}
         if recovery_state:
             yield {"type": "status", "content": "Resuming interrupted tool-agent task."}
-            messages = list(recovery_state.get("messages", []))
+            messages = list(recovery_state.get("messages",[]))
             resume_state = recovery_state.get("lifecycle_state", {})
         else:
             context = self.context_engine.build_agent_context(
@@ -325,7 +322,6 @@ class ToolAgentWorker(BaseAgentWorker):
             resume_state=resume_state,
         )
 
-
 class OrchestratorWorker(BaseAgentWorker):
     worker_type = AgentWorkerType.ORCHESTRATOR
 
@@ -356,7 +352,7 @@ class OrchestratorWorker(BaseAgentWorker):
             yield {"type": "status", "content": "Resuming interrupted orchestration task."}
             plan = MultiAgentPlan.model_validate(recovery_state.get("plan", {}))
             collaborator_results: List[Dict[str, Any]] = list(
-                recovery_state.get("collaborator_results", [])
+                recovery_state.get("collaborator_results",[])
             )
             start_index = int(recovery_state.get("next_task_index", 0))
         else:
@@ -364,7 +360,7 @@ class OrchestratorWorker(BaseAgentWorker):
                 query,
                 rag_available=self.rag_worker is not None,
             )
-            collaborator_results = []
+            collaborator_results =[]
             start_index = 0
         yield {"type": "multi_agent_plan", "data": plan.to_trace_data()}
         yield {
@@ -407,7 +403,7 @@ class OrchestratorWorker(BaseAgentWorker):
                     answer_text = event.get("content", "") or answer_text
                     continue
                 if event_type == "finish":
-                    finish_messages = event.get("new_messages", [])
+                    finish_messages = event.get("new_messages",[])
                     if not answer_text:
                         answer_text = self._extract_finish_answer(finish_messages)
                     break
@@ -471,7 +467,7 @@ class OrchestratorWorker(BaseAgentWorker):
 
         yield {
             "type": "finish",
-            "new_messages": [
+            "new_messages":[
                 {"role": "assistant", "content": final_answer},
             ],
             "worker": self.worker_type.value,
@@ -508,7 +504,7 @@ class OrchestratorWorker(BaseAgentWorker):
         )
 
     def _extract_finish_answer(self, messages: List[Dict[str, Any]]) -> str:
-        for message in reversed(messages or []):
+        for message in reversed(messages or[]):
             if message.get("role") == "assistant" and message.get("content"):
                 return str(message.get("content"))
         return ""
@@ -540,7 +536,7 @@ class OrchestratorWorker(BaseAgentWorker):
             "Produce the final answer for the user. "
             "Do not mention internal worker names unless it improves clarity."
         )
-        return [
+        return[
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": user_prompt},
         ]
