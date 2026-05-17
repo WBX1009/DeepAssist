@@ -19,6 +19,7 @@ logger = get_logger(__name__)
 class ChatApplication:
     """Chat workflow orchestrator for quick chat and RAG chat modes."""
 
+    # NOTE: Legacy constant retained for backward-compatibility. 动态诊断已取代该阈值。
     _RAG_RELEVANCE_THRESHOLD = 0.1
 
     def __init__(
@@ -49,7 +50,6 @@ class ChatApplication:
         return self.session_mgr.delete_session(session_id)
 
     def _analyze_query_intent(self, query: str) -> dict:
-        """🌟 核心改造：使用 LLM 替代传统正则表达式进行查询意图分析"""
         default_intent = {"is_small_talk": False, "is_explicit_kb": False, "is_negative_kb": False}
         if not query.strip():
             return default_intent
@@ -408,27 +408,6 @@ class ChatApplication:
                 response_chunks.append(chunk)
                 yield SSEManager.format_event(StreamEvent.message_delta(chunk))
 
-    def _collect_llm_response(
-        self,
-        messages,
-        model_name: Optional[str] = None,
-        temperature: Optional[float] = None,
-        top_p: Optional[float] = None,
-    ) -> str:
-        chunks: list[str] =[]
-        for chunk in self.llm.chat_stream(
-            messages,
-            model_name=model_name,
-            temperature=temperature,
-            top_p=top_p,
-        ):
-            if isinstance(chunk, dict):
-                if chunk.get("type") != "reasoning":
-                    chunks.append(chunk["content"])
-            else:
-                chunks.append(chunk)
-        return "".join(chunks)
-
     def _emit_buffered_text(
         self,
         text: str,
@@ -443,12 +422,18 @@ class ChatApplication:
             yield SSEManager.format_event(StreamEvent.message_delta(chunk))
 
     def _should_fallback_from_rag(self, pipeline_result) -> bool:
-        documents = pipeline_result.retrieval_result.documents
-        if not documents:
-            return True
-
-        best_score = documents[0].score or 0.0
-        return best_score < self._RAG_RELEVANCE_THRESHOLD
+        """
+        🌟 Legacy fallback predicate based on a static relevance threshold.
+        It remains for backward-compatibility but is now practically unused.
+        Fallback decisions rely on dynamic diagnostics such as 'reason_code' in retrieval metadata.
+        """
+        diagnostics = (
+            pipeline_result.retrieval_result.metadata.get("diagnostics", {})
+            if pipeline_result.retrieval_result.metadata
+            else {}
+        )
+        reason_code = diagnostics.get("reason_code")
+        return reason_code in {"no_hits", "low_relevance", "all_channels_failed"}
 
     def _decide_rag_fallback(self, pipeline_result, is_explicit_kb: bool) -> dict:
         diagnostics = (
