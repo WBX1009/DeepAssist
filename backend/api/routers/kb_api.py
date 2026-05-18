@@ -5,7 +5,6 @@ from backend.application.kb_app import KnowledgeBaseApp
 
 router = APIRouter(prefix="/api/kb", tags=["Knowledge Base"])
 
-
 @router.post("/upload")
 async def upload_document(
     file: UploadFile = File(...),
@@ -18,7 +17,7 @@ async def upload_document(
     except UnicodeDecodeError as exc:
         raise HTTPException(
             status_code=400,
-            detail="Only UTF-8 text or Markdown files are supported by the current ingestion pipeline.",
+            detail="Only UTF‑8 text or Markdown files are supported by the current ingestion pipeline.",
         ) from exc
 
     return app.process_document(
@@ -27,7 +26,6 @@ async def upload_document(
         collection_name=collection_name,
     )
 
-
 @router.get("/files")
 def list_files(
     collection_name: str = Query(default="tech_docs_kb"),
@@ -35,25 +33,11 @@ def list_files(
 ) -> dict:
     return app.list_files(collection_name=collection_name)
 
-
 @router.get("/collections")
 def list_collections(
     app: KnowledgeBaseApp = Depends(get_kb_app),
 ) -> dict:
     return app.list_collections()
-
-
-@router.get("/health")
-def get_health_report(
-    refresh: bool = Query(default=False),
-    collection_name: list[str] | None = Query(default=None),
-    app: KnowledgeBaseApp = Depends(get_kb_app),
-) -> dict:
-    return app.get_health_report(
-        refresh=refresh,
-        collections=collection_name,
-    )
-
 
 @router.delete("/files/{source_file:path}")
 def delete_file(
