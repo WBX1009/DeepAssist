@@ -3,12 +3,12 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
+from backend.domain.interfaces.kb_manifest_store import BaseKnowledgeBaseManifestStore
 
 def _utc_now_iso() -> str:
     return datetime.now(timezone.utc).replace(microsecond=0).isoformat()
 
-
-class KnowledgeBaseManifestStore:
+class KnowledgeBaseManifestStore(BaseKnowledgeBaseManifestStore):
     """Persist lightweight collection/file inventory for fast UI and API reads."""
 
     def __init__(self, manifest_path: str):
@@ -161,49 +161,3 @@ class KnowledgeBaseManifestStore:
             collection["stores"] = sorted(set(stores))
         self._recalculate_collection(collection)
         self.save(manifest)
-
-    def _collection_payload(self, collection_name: str) -> Optional[Dict[str, Any]]:
-        manifest = self.load()
-        collections = manifest.get("collections", {})
-        if not isinstance(collections, dict):
-            return None
-        payload = collections.get(collection_name)
-        return payload if isinstance(payload, dict) else None
-
-    def _ensure_collection(self, manifest: Dict[str, Any], collection_name: str) -> Dict[str, Any]:
-        collections = manifest.setdefault("collections", {})
-        if not isinstance(collections, dict):
-            collections = {}
-            manifest["collections"] = collections
-        payload = collections.setdefault(
-            collection_name,
-            {
-                "collection_name": collection_name,
-                "file_count": 0,
-                "chunk_count": 0,
-                "stores": ["vector", "keyword"],
-                "consistent": True,
-                "metadata": {},
-                "files": {},
-                "updated_at": _utc_now_iso(),
-            },
-        )
-        return payload
-
-    def _recalculate_collection(self, collection: Dict[str, Any]) -> None:
-        files = collection.get("files", {})
-        if not isinstance(files, dict):
-            files = {}
-            collection["files"] = files
-        values = [item for item in files.values() if isinstance(item, dict)]
-        collection["file_count"] = len(values)
-        collection["chunk_count"] = sum(int(item.get("chunk_count", 0) or 0) for item in values)
-        collection["consistent"] = all(bool(item.get("consistent", True)) for item in values) if values else True
-        collection["updated_at"] = _utc_now_iso()
-
-    def _empty_manifest(self) -> Dict[str, Any]:
-        return {
-            "schema_version": 1,
-            "updated_at": _utc_now_iso(),
-            "collections": {},
-        }
