@@ -34,10 +34,9 @@ class Settings(BaseSettings):
     # 默认值为 0.2，低于旧版固定的 0.35，更好地适配长句查询和复杂指令。
     RAG_LOW_RELEVANCE_THRESHOLD: float = Field(default=0.2)
 
-    # === [Agent配置] ===
     MAX_AGENT_STEPS: int = 10
-    ALLOWED_TOOL_CATEGORIES: str = "read_only,write_file,network,db_query"
-
+    # 允许的工具类别，加入 code_exec 以允许 execute_python_code 调用
+    ALLOWED_TOOL_CATEGORIES: str = "read_only,write_file,network,db_query,code_exec"
     model_config = SettingsConfigDict(
         env_file=".env",
         env_file_encoding="utf-8",

@@ -4,7 +4,7 @@ from pydantic import BaseModel, Field
 
 
 class KnowledgeBaseFile(BaseModel):
-    """File-level summary for a knowledge-base collection."""
+    """File‑level summary for a knowledge‑base collection."""
 
     source_file: str = Field(..., description="Original uploaded file name")
     chunk_count: int = Field(default=0, ge=0, description="Number of chunks in this store")
@@ -12,6 +12,14 @@ class KnowledgeBaseFile(BaseModel):
 
     def to_dict(self) -> Dict[str, Any]:
         return self.model_dump()
+
+    def update_metadata(self, key: str, value: Any) -> None:
+        """Update or add a metadata entry."""
+        self.metadata[key] = value
+
+    def increment_chunk_count(self, increment: int = 1) -> None:
+        """Increment the stored chunk count."""
+        self.chunk_count += increment
 
 
 class KnowledgeBaseCollectionHealth(BaseModel):

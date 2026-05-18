@@ -7,15 +7,13 @@ from backend.domain.entities.knowledge_base import KnowledgeBaseFile
 from backend.domain.interfaces.embedding import BaseEmbedding
 from backend.domain.interfaces.keyword_db import BaseKeywordDB
 from backend.domain.interfaces.vector_db import BaseVectorDB
-from backend.infrastructure.databases.kb_manifest_store import KnowledgeBaseManifestStore
-from backend.infrastructure.databases.vector_index_health import VectorIndexHealthInspector
+from backend.domain.interfaces.kb_manifest_store import BaseKnowledgeBaseManifestStore
 from backend.services.rag.chunking import DocumentChunker
 
 logger = get_logger(__name__)
 
-
 class KnowledgeBaseApp:
-    """Knowledge-base ingestion workflow orchestrator."""
+    """Knowledge‑base ingestion workflow orchestrator."""
 
     def __init__(
         self,
@@ -23,27 +21,25 @@ class KnowledgeBaseApp:
         embedding_model: BaseEmbedding | None,
         vector_db: BaseVectorDB | None,
         keyword_db: BaseKeywordDB | None,
-        health_inspector: VectorIndexHealthInspector | None = None,
+        manifest_store: BaseKnowledgeBaseManifestStore,
     ):
         self.chunker = chunker
         self.embedding = embedding_model
         self.vector_db = vector_db
         self.keyword_db = keyword_db
-        self.health_inspector = health_inspector
-        self.manifest_store = KnowledgeBaseManifestStore(settings.KB_MANIFEST_PATH)
+        # Manifest store injected via domain interface
+        self.manifest_store = manifest_store
 
     def _rollback_vector_write(self, collection_name: str, file_name: str) -> bool:
         if self.vector_db is None:
             logger.error("Vector rollback skipped because vector DB is unavailable")
             return False
-
         logger.warning("Starting vector rollback for %s", file_name)
         try:
             rollback_success = self.vector_db.delete_by_source(collection_name, file_name)
         except Exception as exc:
             logger.error("Vector rollback raised for %s: %s", file_name, exc)
             return False
-
         if rollback_success:
             logger.info("Vector rollback completed for %s", file_name)
         else:
@@ -54,7 +50,7 @@ class KnowledgeBaseApp:
         return bool(self.embedding and self.vector_db and self.keyword_db)
 
     def list_files(self, collection_name: str = "tech_docs_kb") -> dict:
-        """Return file-level KB inventory merged from vector and keyword stores."""
+        """Return file‑level KB inventory merged from vector and keyword stores."""
         manifest_files = self.manifest_store.list_files(collection_name)
         if manifest_files:
             return {
@@ -126,7 +122,7 @@ class KnowledgeBaseApp:
         }
 
     def list_collections(self) -> dict:
-        """Return collection-level inventory merged from vector and keyword stores."""
+        """Return collection‑level inventory merged from vector and keyword stores."""
         records: dict[str, dict] = {}
         errors: dict[str, str] = {}
         manifest_items = {
@@ -182,51 +178,6 @@ class KnowledgeBaseApp:
             "source": "manifest_summary",
         }
 
-    def get_health_report(
-        self,
-        refresh: bool = False,
-        collections: list[str] | None = None,
-    ) -> dict:
-        if self.health_inspector is None:
-            return {
-                "status": "error",
-                "message": "Knowledge-base health inspector is unavailable",
-                "data": {},
-            }
-
-        cached_report = self.health_inspector.load_report()
-        if not refresh and cached_report is not None:
-            return {
-                "status": "success",
-                "source": "cached",
-                "data": cached_report.model_dump(),
-            }
-
-        try:
-            report = self.health_inspector.inspect(
-                collections=collections,
-                persist=True,
-            )
-            return {
-                "status": "success",
-                "source": "live",
-                "data": report.model_dump(),
-            }
-        except Exception as exc:
-            logger.error("Failed to refresh KB health report: %s", exc)
-            if cached_report is not None:
-                return {
-                    "status": "partial_success",
-                    "source": "cached",
-                    "message": f"Live refresh failed: {exc}",
-                    "data": cached_report.model_dump(),
-                }
-            return {
-                "status": "error",
-                "message": f"Knowledge-base health check failed: {exc}",
-                "data": {},
-            }
-
     def delete_file(
         self,
         file_name: str,
@@ -281,7 +232,7 @@ class KnowledgeBaseApp:
         logger.error("KB source delete incomplete for %s: %s", source_file, errors)
         return {
             "status": "error",
-            "message": "Knowledge-base delete was incomplete",
+            "message": "Knowledge‑base delete was incomplete",
             "data": {
                 "source_file": source_file,
                 "vector_deleted": vector_success,
@@ -307,13 +258,13 @@ class KnowledgeBaseApp:
         content: str,
         collection_name: str = "tech_docs_kb",
     ) -> dict:
-        logger.info("Received knowledge-base ingestion request: %s", file_name)
+        logger.info("Received knowledge‑base ingestion request: %s", file_name)
 
         if not self._is_ready_for_ingestion():
-            logger.error("Knowledge-base ingestion rejected because dependencies are unavailable")
+            logger.error("Knowledge‑base ingestion rejected because dependencies are unavailable")
             return {
                 "status": "error",
-                "message": "Knowledge-base ingestion dependencies are unavailable",
+                "message": "Knowledge‑base ingestion dependencies are unavailable",
             }
 
         chunks = self.chunker.split_markdown(content, source_name=file_name)
@@ -363,7 +314,7 @@ class KnowledgeBaseApp:
             }
 
         except Exception as exc:
-            logger.error("Knowledge-base ingestion failed for %s: %s", file_name, exc)
+            logger.error("Knowledge‑base ingestion failed for %s: %s", file_name, exc)
             if v_success:
                 logger.warning("Exception after vector write for %s; starting vector rollback", file_name)
                 self._rollback_vector_write(collection_name, file_name)
@@ -376,20 +327,12 @@ class KnowledgeBaseApp:
         chunks: List[DocumentChunk],
     ) -> dict:
         """
-        Ingest a batch of pre-chunked DocumentChunk objects into the specified collection.
+        Ingest a batch of pre‑chunked DocumentChunk objects into the specified collection.
 
         This method computes embeddings for the provided chunks, writes them to the vector store
         and keyword index, and handles rollback on failure. It returns a status dict describing
         the outcome. Manifest updates are not performed here and should be handled externally
         by the caller when batching across multiple calls.
-
-        Args:
-            collection_name: Name of the target knowledge base collection.
-            chunks: A list of DocumentChunk instances to ingest.
-
-        Returns:
-            A dictionary with keys "status" and additional information such as "count" on
-            success or "message" on error.
         """
         logger.info(
             "Received batch ingestion request: %s chunks into collection %s",
@@ -401,7 +344,7 @@ class KnowledgeBaseApp:
             logger.error("Batch ingestion rejected because dependencies are unavailable")
             return {
                 "status": "error",
-                "message": "Knowledge-base ingestion dependencies are unavailable",
+                "message": "Knowledge‑base ingestion dependencies are unavailable",
             }
 
         if not chunks:

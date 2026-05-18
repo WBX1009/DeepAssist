@@ -12,10 +12,11 @@ from backend.domain.interfaces.keyword_db import BaseKeywordDB
 from backend.domain.interfaces.llm import BaseLLM
 from backend.domain.interfaces.memory_db import BaseMemoryStore
 from backend.domain.interfaces.vector_db import BaseVectorDB
+from backend.domain.interfaces.kb_manifest_store import BaseKnowledgeBaseManifestStore
 from backend.infrastructure.databases.chroma_store import ChromaStore
 from backend.infrastructure.databases.sqlite_memory import SQLiteMemoryStore
-from backend.infrastructure.databases.vector_index_health import VectorIndexHealthInspector
 from backend.infrastructure.databases.whoosh_store import WhooshStore
+from backend.infrastructure.databases.kb_manifest_store import KnowledgeBaseManifestStore
 from backend.infrastructure.embeddings.bge_m3_local import BGEM3Local
 from backend.infrastructure.llms.deepseek_client import DeepSeekClient
 from backend.infrastructure.tools.file_ops import (
@@ -94,13 +95,9 @@ def get_memory_store() -> BaseMemoryStore:
     return SQLiteMemoryStore()
 
 @lru_cache()
-def get_vector_index_health_inspector() -> VectorIndexHealthInspector:
-    return VectorIndexHealthInspector(
-        vector_db_path=settings.VECTOR_DB_PATH,
-        keyword_db_path=settings.KEYWORD_DB_PATH,
-        report_path=settings.VECTOR_HEALTH_REPORT_PATH,
-        embedding_model=get_embedding_model(),
-    )
+def get_manifest_store() -> BaseKnowledgeBaseManifestStore:
+    """Provide a manifest store via the abstract interface."""
+    return KnowledgeBaseManifestStore(settings.KB_MANIFEST_PATH)
 
 # -----------------------------------------------------------------------------
 # RAG service graph (Lightweight, Recreated per request if dependent on dynamic config)
@@ -213,7 +210,7 @@ def _build_agent_tools(
     rag_pipeline: Optional[RAGPipeline],
     kb_app: KnowledgeBaseApp,
 ) -> List[Callable[..., Any]]:
-    tools: List[Callable[..., Any]] =[
+    tools: List[Callable[..., Any]] = [
         read_local_file,
         write_local_file,
         list_sandbox_files,
@@ -260,7 +257,7 @@ def get_tool_registry() -> ToolRegistry:
         )
     except Exception:
         allowed_categories = None
-        
+
     policy = ToolPolicy(
         max_result_chars=4000,
         allowed_categories=allowed_categories,
@@ -341,7 +338,7 @@ def get_kb_app() -> KnowledgeBaseApp:
         embedding_model=get_embedding_model(),
         vector_db=get_vector_db(),
         keyword_db=get_keyword_db(),
-        health_inspector=get_vector_index_health_inspector(),
+        manifest_store=get_manifest_store(),
     )
 
 def get_runtime_app() -> RuntimeApplication:
