@@ -7,3 +7,15 @@ class DocumentChunk(BaseModel):
     content: str = Field(..., description="文档正文内容")
     metadata: Dict[str, Any] = Field(default_factory=dict, description="元数据，如来源、页码、标题层级等")
     score: Optional[float] = Field(default=None, description="检索打分（可选）")
+
+    def token_count(self) -> int:
+        """Return the number of characters in the content."""
+        return len(self.content)
+
+    def add_metadata(self, key: str, value: Any) -> None:
+        """Add or update a metadata entry on this document chunk."""
+        self.metadata[key] = value
+
+    def get_metadata(self, key: str, default: Any = None) -> Any:
+        """Fetch a metadata value with an optional default."""
+        return self.metadata.get(key, default)
